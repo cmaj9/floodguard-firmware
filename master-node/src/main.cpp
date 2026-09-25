@@ -74,7 +74,6 @@ bool          joinSleepPhase      = false;
 unsigned long joinSleepStartTime  = 0;
 
 // ================= ตัวแปรจับเวลา =================
-unsigned long lastSendTime       = 0;
 unsigned long activeStartTime    = 0;
 unsigned long screenTimer        = 0;
 unsigned long lastDisplayUpdate  = 0;
@@ -112,10 +111,6 @@ float gyroX = 0, gyroY = 0;
 #define LVL_MAX_VALID  1000.0f
 
 #define  ESP32_MAX_FAIL    3
-bool     esp32LinkLost    = false;
-
-float totalTilt      = 0.0f;
-float correctedLevel = 0.0f;
 
 // ================= SHT30 =================
 #define SHT30_SDA 6
@@ -140,7 +135,6 @@ int      station_id          = 1;
 uint32_t currentEpoch        = 0;
 
 bool     gpsValidCached = false;
-uint32_t gpsSatsCached  = 0;
 
 // ================= Battery =================
 const float BAT_R1        = 100000.0f;
@@ -798,17 +792,13 @@ void readSensorsQuick()
         gyroX                = gxLocal;
         gyroY                = gyLocal;
         tiltStatus           = tiltLocal;
-        totalTilt            = totalTiltLocal;
-        correctedLevel       = correctedLevel;
         currentTemp          = tempLocal;
         currentHum           = humLocal;
         currentLat           = latLocal;
         currentLng           = lngLocal;
         gpsValidCached       = gpsValidLocal;
-        gpsSatsCached        = satsLocal;
         finalBatteryVoltage  = battVoltLocal;
         batPercentage        = battPctLocal;
-        esp32LinkLost        = esp32LinkLostLocal;
         currentEpoch         = epochLocal;
         sensorDataReady       = true;
         xSemaphoreGive(sensorMutex);
@@ -995,11 +985,6 @@ void loop()
         }
 
         case DEVICE_STATE_JOIN: {
-            if (joinSleepPhase) {
-                LoRaWAN.sleep(loraWanClass);
-                break;
-            }
-
             if (!joinTimerStarted) {
                 digitalWrite(RELAY_PIN, HIGH);  // เปิดไฟเลี้ยงวงจรเซนเซอร์รอบใหม่
                 isScreenOn = true;
@@ -1027,10 +1012,6 @@ void loop()
         case DEVICE_STATE_SEND: {
             digitalWrite(RELAY_PIN, HIGH);
 
-            joinTimerStarted    = false;
-            joinSleepPhase      = false;
-            joinFallbackStarted = false;
-
             // หน่วงเวลา 4 วินาทีหลัง Join สำเร็จ เพื่อให้ Gateway & Network Server พร้อมรับ Uplink
             Serial.println("[SEND] รอ Gateway ตั้งค่า Session ให้เสร็จสมบูรณ์ (4 วินาที)...");
             delay(4000);
@@ -1054,8 +1035,6 @@ void loop()
             }
             digitalWrite(LED_GREEN_PIN, HIGH);
 
-            uint16_t sentCount = 0;
-
             // 2. ทยอยส่ง Backlog จาก Flash พร้อมระบบ Retry 2 ครั้งต่อแพ็กเก็ต
             if (backlogCount > 0) {
                 Serial.printf("[MODE] ต่อ Gateway ติด! กำลังทยอยส่ง Backlog ย้อนหลัง %d packet...\n", backlogCount);
@@ -1078,7 +1057,6 @@ void loop()
 
                     if (acked) {
                         dequeueBacklog();
-                        sentCount++;
                         Serial.printf("[BACKLOG] ส่งสำเร็จ 1 packet (คงเหลือ %d packet)\n", backlogCount);
                         updateDisplay();
 
@@ -1152,7 +1130,6 @@ void loop()
             if (rndMs < 10000L) rndMs = 10000L;
             currentTxWait   = (uint32_t)rndMs;
             txDutyCycleTime = currentTxWait;
-            lastSendTime    = millis();
 
             isScreenOn      = true;
             screenTimer     = millis();

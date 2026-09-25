@@ -18,7 +18,6 @@ SoftwareSerial HeltecSerial;          // ส่งไป Heltec
 
 // ================= GLOBAL VARIABLES =================
 float currentLevel    = 0.0;
-float correctedLevel  = 0.0;
 float gyroX = 0, gyroY = 0;
 float totalTilt = 0;
 String tiltStatus = "OK";
@@ -150,7 +149,7 @@ void readSensorsQuick() {
 // ================= PRINT TO TERMINAL =================
 void printSensorData() {
   Serial.println("===== SENSOR DATA =====");
-  Serial.printf("LEVEL  -> Raw: %.1f cm  Corrected: %.1f cm\n", currentLevel, correctedLevel);
+  Serial.printf("LEVEL  -> %.1f cm\n", currentLevel);
   Serial.printf("TILT   -> X: %.1f  Y: %.1f  Total: %.1f  Status: %s\n",
                 gyroX, gyroY, totalTilt, tiltStatus.c_str());
   Serial.println("========================");
@@ -176,22 +175,24 @@ bool sendPayloadToHeltec() {
   Serial.println("TX -> " + payload);
 
   unsigned long start = millis();
-  String resp = "";
+  bool gotAck = false;
   while (millis() - start < ACK_TIMEOUT_MS) {
     if (HeltecSerial.available()) {
-      char c = HeltecSerial.read();
-      if (c == '\n') break;
-      resp += c;
+      String resp = HeltecSerial.readStringUntil('\n');
+      resp.trim();
+      if (resp.indexOf("ACK") >= 0) {
+        Serial.println("Heltec: ส่งสำเร็จ (ACK received)");
+        gotAck = true;
+        break;
+      }
     }
+    delay(1);
   }
 
-  if (resp.indexOf("ACK") >= 0) {
-    Serial.println("Heltec: ส่งสำเร็จ (ACK received)");
-    return true;
-  } else {
+  if (!gotAck) {
     Serial.println("Heltec: ส่งไม่สำเร็จ (No ACK / Timeout)");
-    return false;
   }
+  return gotAck;
 }
 
 // ================= MAIN LOOP =================
@@ -221,26 +222,7 @@ void loop() {
       Serial.println("REQ received → reading sensors...");
       readSensorsQuick();
       printSensorData();
-
-      String payload = buildPayload();
-      HeltecSerial.println(payload);
-      Serial.println("TX -> " + payload);
-
-      unsigned long start = millis();
-      bool gotAck = false;
-      while (millis() - start < 1000) {
-        if (HeltecSerial.available()) {
-          String resp = HeltecSerial.readStringUntil('\n');
-          resp.trim();
-          if (resp == "ACK") {
-            Serial.println("Heltec: ส่งสำเร็จ");
-            gotAck = true;
-            break;
-          }
-        }
-        delay(1);
-      }
-      if (!gotAck) Serial.println("Heltec: ไม่ได้รับ ACK");
+      sendPayloadToHeltec();
     }
   }
 
