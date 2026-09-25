@@ -1,72 +1,98 @@
-# IoT Sensor Node (ESP32-C3 + Heltec LoRaWAN V3)
+# FloodGuard Firmware (IoT Telemetry Node System)
 
-ระบบตรวจวัดระดับน้ำและมุมเอียง พร้อมส่งข้อมูลระยะไกลผ่านเครือข่าย LoRaWAN (OTAA) โดยทำงานร่วมกันระหว่างบอร์ดอ่านเซนเซอร์ (ESP32-C3) และบอร์ดส่งสัญญาณวิทยุ (Heltec WiFi LoRa 32 V3)
+เฟิร์มแวร์สำหรับระบบตรวจวัดระดับน้ำและแจ้งเตือนภัยน้ำท่วม **FloodGuard** โดยออกแบบการทำงานเป็นสถาปัตยกรรม **Master-Subnode Architecture** ที่เชื่อมต่อข้อมูลผ่านสายสัญญาณมาตรฐานอุตสาหกรรม **RS485** และส่งข้อมูลระยะไกลขึ้นคลาวด์ผ่าน **LoRaWAN (OTAA)**
 
 ---
 
-## 📐 โครงสร้างระบบ (Architecture)
+## 📐 สถาปัตยกรรมระบบ (System Architecture)
 
 ```text
-Project_Node/
-├── esp32-c3/               # Firmware อ่านเซนเซอร์ (UART / SoftwareSerial)
-│   ├── src/main.cpp        # Ultrasonic (A01NYUB) + Gyro/Tilt (GY-25)
-│   └── platformio.ini
-│
-└── heltec-lora32/          # Firmware จัดการ LoRaWAN, GPS, Backlog, Display
-    ├── src/main.cpp        # OTAA Join, LittleFS Flash Backlog, Power Control
-    ├── include/
-    │   ├── credentials.h.example  # Template สำหรับตั้งค่า LoRaWAN Keys
-    │   └── credentials.h          # [Local only] ไฟล์เก็บ Keys จริง (ถูก ignore จาก Git)
-    └── platformio.ini
+               +-------------------------------------------+
+               |             FloodGuard System             |
+               +-------------------------------------------+
+                                     │
+      RS485 (Industrial Serial)      │ LoRaWAN (AS923 / OTAA)
+   ┌─────────────────────────────┐   │
+   ▼                             ▼   ▼
+┌──────────────────┐          ┌──────────────────────────────────┐
+│  sensor-subnode  │ ──RS485─►│           master-node            │ ──LoRaWAN─► Cloud / TTN
+│    (ESP32-C3)    │          │     (Heltec WiFi LoRa 32 V3)     │
+└──────────────────┘          └──────────────────────────────────┘
+  - Ultrasonic (A01NYUB)        - LoRaWAN OTAA Transmitter
+  - Gyro / Tilt (GY-25)         - GPS (Epoch Timestamping)
+  - RS485 Slave Transmitter     - Flash Backlog Storage (LittleFS)
+                                - SHT30 Temp / Humidity
+                                - OLED Display & Battery Monitor
+                                - External Power Switch (Relay Pin 26)
 ```
 
 ---
 
-## ⚡ หน้าที่ของแต่ละบอร์ด
+## 📁 โครงสร้างโปรเจกต์ (Repository Structure)
 
-### 1. `esp32-c3` (Sensor Acquisition Unit)
-- **Ultrasonic (A01NYUB)**: อ่านระยะห่างผิวน้ำ/ระดับน้ำผ่าน UART1 (สลับ Bus)
-- **Gyroscope/Inclinometer (GY-25)**: อ่านค่ามุมเอียงแกน X, Y เพื่อคำนวณสถานะความเอียง (OK / WARN / TILT)
-- **Serial Bridge**: สื่อสารกับบอร์ด Heltec ผ่าน SoftwareSerial (คำสั่ง REQ / ข้อมูล Payload + ACK)
-
-### 2. `heltec-lora32` (LoRaWAN Gateway Node / Transmitter)
-- **LoRaWAN OTAA (AS923)**: ส่งข้อมูลแบบ Confirmed Uplink พร้อมระบบ Retry สูงสุด 2 ครั้ง
-- **GPS (TinyGPSPlus)**: ดึงพิกัดตำแหน่งและ Unix Epoch Timestamp จาก NMEA RMC
-- **SHT30**: ตรวจวัดอุณหภูมิและความชื้นสัมพัทธ์ในกล่องอุปกรณ์
-- **Battery Monitor**: วัดแรงดันและเปอร์เซ็นต์แบตเตอรี่ผ่าน ADC
-- **LittleFS Flash Backlog**: เก็บสะสมประวัติข้อมูลขนาด 26 ไบต์ลง Flash อัตโนมัติหากอยู่ในช่วง Offline หรือ Join ไม่ผ่าน และจะทยอยส่งออกเมื่อเชื่อมต่อได้
-- **Power Management (Relay Pin 26)**: ควบคุมไฟเลี้ยงเซนเซอร์ภายนอกเพื่อประหยัดพลังงานในโหมด Sleep
+```text
+floodguard-firmware/
+├── .gitignore
+├── README.md
+│
+├── master-node/                # โหนดแม่: Heltec WiFi LoRa 32 V3
+│   ├── platformio.ini          # ค่าคอนฟิกบอร์ด, LoRaWAN flag, libraries
+│   ├── src/main.cpp            # โค้ดหลัก (LoRaWAN State Machine, Backlog, RS485 Bridge)
+│   └── include/
+│       ├── credentials.h.example  # Template สำหรับระบุ LoRaWAN Keys
+│       └── credentials.h          # [Local only] ไฟล์เก็บ Keys จริง (ไม่ถูก commit ขึ้น Git)
+│
+└── sensor-subnode/             # โหนดลูก: ESP32-C3
+    ├── platformio.ini          # ค่าคอนฟิก ESP32-C3
+    └── src/main.cpp            # โค้ดอ่าน Ultrasonic A01NYUB + Gyro GY-25 ส่งผ่าน RS485
+```
 
 ---
 
-## 🚀 การติดตั้งและใช้งาน (Getting Started)
+## ⚡ รายละเอียดของแต่ละโหนด
+
+### 1. `sensor-subnode` (ESP32-C3 - โหนดลูก)
+- **วัดระดับน้ำ (Ultrasonic A01NYUB)**: อ่านระยะห่างผิวน้ำผ่าน UART1 พร้อมระบบตรวจสอบ Checksum
+- **วัดความเอียง (GY-25)**: อ่านค่าแกน X, Y เพื่อตรวจสอบองศาการเอียงของทุ่น/เสาวัด (`OK`, `WARN`, `TILT`)
+- **การส่งข้อมูล (RS485)**: รับคำขอ (`REQ`) จากโหนดแม่ และส่งชุดข้อมูล Packet (`RawLevel, GyroX, GyroY, TiltStatus`) กลับพร้อมรอรับ `ACK`
+
+### 2. `master-node` (Heltec WiFi LoRa 32 V3 - โหนดแม่)
+- **LoRaWAN OTAA (AS923)**: ส่งข้อมูลแบบ Confirmed Uplink พร้อมระบบ Auto Retry สูงสุด 2 ครั้ง ล็อก DataRate ที่ DR 2 (SF10) เพื่อความเสถียร
+- **GPS Timestamp (TinyGPSPlus)**: ดึงเวลาสากล Unix Epoch จาก NMEA RMC ฝังลงใน Payload
+- **Flash Backlog (LittleFS)**: จัดเก็บข้อมูลประวัติขนาด 26 ไบต์ลง Flash ทันทีหากออฟไลน์หรือเครือข่ายขัดข้อง และจะทยอยส่งออกเมื่อระบบกลับมาเชื่อมต่อได้
+- **เซนเซอร์สภาพแวดล้อมและพลังงาน**: SHT30 (อุณหภูมิ/ความชื้น) และวงจรวัดโวลต์แบตเตอรี่พร้อม Median + EMA Filter
+- **ระบบประหยัดพลังงาน**: ควบคุมเปิด-ปิดไฟเลี้ยงวงจรภายนอกและหน้าจอผ่าน Relay (Pin 26)
+
+---
+
+## 🚀 การติดตั้งและพัฒนา (Getting Started)
 
 ### 1. เครื่องมือที่ต้องใช้
-- [VS Code](https://code.visualstudio.com/)
+- [Visual Studio Code](https://code.visualstudio.com/)
 - [PlatformIO IDE Extension](https://platformio.org/)
 
-### 2. ตั้งค่า LoRaWAN Credentials (สำคัญมาก)
-ไฟล์ `credentials.h` ที่มีคีย์จริงถูกยกเว้นจาก Git เพื่อความปลอดภัย ให้ทำตามขั้นตอนนี้:
+### 2. ตั้งค่า LoRaWAN Credentials
+ก่อนจะ Compile บอร์ด `master-node` ให้สร้างไฟล์ `credentials.h` จาก Template:
 
 1. คัดลอกไฟล์เทมเพลต:
    ```bash
-   cp heltec-lora32/include/credentials.h.example heltec-lora32/include/credentials.h
+   cp master-node/include/credentials.h.example master-node/include/credentials.h
    ```
-2. เปิดไฟล์ `heltec-lora32/include/credentials.h` แล้วใส่คีย์ที่ได้จาก The Things Network (TTN) หรือ LoRaWAN Network Server:
+2. แก้ไขไฟล์ `master-node/include/credentials.h` โดยใส่คีย์จาก The Things Network (TTN) หรือ Network Server ของคุณ:
    ```cpp
    uint8_t devEui[] = { 0x.. };
    uint8_t appEui[] = { 0x.. };
    uint8_t appKey[] = { 0x.. };
    ```
 
-### 3. การ Build & Flash Firmware
-ใช้คำสั่ง PlatformIO ผ่าน Terminal หรือปุ่มบน VS Code:
+### 3. คำสั่ง Build & Flash Firmware
+คุณสามารถคลิกปุ่มบน PlatformIO Toolbar หรือใช้คำสั่ง Terminal:
 
-- **บอร์ด ESP32-C3**:
+- **Flash โหนดลูก (sensor-subnode)**:
   ```bash
-  pio run -d esp32-c3 -t upload
+  pio run -d sensor-subnode -t upload
   ```
-- **บอร์ด Heltec LoRa32**:
+- **Flash โหนดแม่ (master-node)**:
   ```bash
-  pio run -d heltec-lora32 -t upload
+  pio run -d master-node -t upload
   ```
