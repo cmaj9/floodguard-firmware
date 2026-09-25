@@ -1,0 +1,16 @@
+# PlatformIO build artifacts & dependencies
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# VS Code environment & workspace files
+.vscode/
+
+# Sensitive credentials & secrets
+include/credentials.h
+credentials.h
+*secrets.h
+
+# OS generated files
+.DS_Store
+Thumbs.db
