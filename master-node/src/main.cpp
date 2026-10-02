@@ -1,6 +1,6 @@
 /*
  * HELTEC V3 LoRaWAN - MASTER DEPLOYMENT MODE (ESP32-C3 Sensor Bridge)
- * 1. ส่ง LoRaWAN ทุกๆ 5 นาที พร้อมเวลานับถอยหลังบนจอ
+ * 1. ส่ง LoRaWAN ทุกๆ 15 นาที พร้อมเวลานับถอยหลังบนจอ
  * 2. GPS (UART) + Direct RMC Parser -> ฝัง Unix Epoch Timestamp ถาวรใน Payload ไบต์ 22-25
  * 3. หน้าจอ OLED ปิดอัตโนมัติเมื่อเข้าสู่ Sleep (ปลุกด้วยปุ่ม PRG)
  * 4. ระดับน้ำ (ultrasonic) + Gyro: รับค่าจาก ESP32-C3 ผ่าน UART (REQ/ACK)
@@ -47,8 +47,8 @@ uint16_t userChannelsMask[6] = {0x0002, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000};
 LoRaMacRegion_t loraWanRegion = ACTIVE_REGION;
 DeviceClass_t   loraWanClass  = CLASS_A;
 
-uint32_t appTxDutyCycle      = 300000;    // รอบ 5 นาที
-#define  ACTIVE_DURATION      120000UL    // Active phase 2 นาที
+uint32_t appTxDutyCycle      = 900000;    // รอบ 15 นาที
+#define  ACTIVE_DURATION      45000UL     // Active phase 45 วินาที
 
 bool    overTheAirActivation = true;
 bool    loraWanAdr           = false;     // ปิด ADR เพื่อให้คงค่า DR 2 ตลอดเวลา
@@ -59,13 +59,13 @@ uint8_t confirmedNbTrials    = 1;
 // กำหนด DataRate ระดับโกลบอลของไลบรารีให้เป็น DR 2 (SF10)
 int8_t  loraWanDatarate      = DR_2;
 
-uint32_t currentTxWait = 300000;
+uint32_t currentTxWait = 900000;
 
 // ================= OTAA Join Control =================
-#define JOIN_ATTEMPT_TIMEOUT_MS  90000UL   // 90 วิ: ออฟไลน์ -> เซฟลง Flash
-#define JOIN_CYCLE_TOTAL_MS      120000UL  // 120 วิ: จบ Active Phase -> ตัดไฟ Relay เข้า Sleep
-#define JOIN_SLEEP_MS            180000UL  // 180 วิ: Sleep 3 นาที (120s + 180s = 5 นาที)
-#define ACTIVE_BUDGET_MS         110000UL  // เวลาโควตาสูงสุดในการส่งข้อมูลต่อรอบ
+#define JOIN_ATTEMPT_TIMEOUT_MS  30000UL   // 30 วิ: ออฟไลน์ -> เซฟลง Flash ทันที
+#define JOIN_CYCLE_TOTAL_MS      45000UL   // 45 วิ: จบ Active Phase -> ตัดไฟ Relay เข้า Sleep
+#define JOIN_SLEEP_MS            855000UL  // 855 วิ: Sleep 14.25 นาที (45s + 855s = 15 นาที)
+#define ACTIVE_BUDGET_MS         38000UL   // เวลาโควตาสูงสุดในการส่งข้อมูลต่อรอบ (38 วิ)
 
 bool          joinTimerStarted    = false;
 unsigned long joinCycleStartTime  = 0;
@@ -141,7 +141,7 @@ const float BAT_R1        = 100000.0f;
 const float BAT_R2        =  20000.0f;
 const float BAT_DIV_RATIO = (BAT_R1 + BAT_R2) / BAT_R2;
 const float BAT_EMPTY_V   = 11.0f;
-const float BAT_FULL_V    = 12.6f;
+const float BAT_FULL_V    = 13.6f;
 
 // ================= Background Sensor Task =================
 #define SENSOR_READ_INTERVAL_MS      5000
@@ -556,7 +556,7 @@ void saveRemainingBacklogToFlash()
 
 // ================= CONFIRMED UPLINK =================
 #define CONFIRMED_ACK_TIMEOUT_MS   10000
-#define BACKLOG_SEND_SPACING_MS    4000  // เว้นระยะห่างระหว่างแต่ละ packet 4 วินาที
+#define BACKLOG_SEND_SPACING_MS    3000  // เว้นระยะห่างระหว่างแต่ละ packet 3 วินาที
 
 volatile bool waitingForAck     = false;
 volatile bool lastConfirmedAcked = false;
@@ -920,12 +920,12 @@ void loop()
             updateDisplay();
         }
 
-        // ครบ 90 วินาที: ออฟไลน์ -> เซฟสะสมลง Flash ทันที
+        // ครบ 30 วินาที: ออฟไลน์ -> เซฟสะสมลง Flash ทันที
         if (!joinFallbackStarted && jElapsed >= JOIN_ATTEMPT_TIMEOUT_MS) {
             joinFallbackStarted = true;
             currentStatus = "No Join...";
             updateDisplay();
-            Serial.println("[JOIN] 90s Timeout -> Gateway ออฟไลน์: บันทึกข้อมูลสะสมลง Flash ทันที");
+            Serial.println("[JOIN] 30s Timeout -> Gateway ออฟไลน์: บันทึกข้อมูลสะสมลง Flash ทันที");
 
             if (sensorDataReady) {
                 uint8_t payload26[PAYLOAD_TOTAL_SIZE];
@@ -935,7 +935,7 @@ void loop()
             sensorTaskActive = false;
         }
 
-        // ครบ 120 วินาที (2 นาที): จบ Active Phase -> ดับจอ, ตัดไฟ Relay ขา 26, เข้าสู่ Sleep 3 นาที
+        // ครบ 45 วินาที: จบ Active Phase -> ดับจอ, ตัดไฟ Relay ขา 26, ดับ LED, เข้าสู่ Sleep 14.25 นาที
         if (jElapsed >= JOIN_CYCLE_TOTAL_MS) {
             joinSleepPhase     = true;
             joinSleepStartTime = millis();
@@ -945,20 +945,23 @@ void loop()
             oled.ssd1306_command(SSD1306_DISPLAYOFF);
             currentStatus = "Sleep";
 
-            digitalWrite(RELAY_PIN, LOW);   // ตัดไฟวงจรภายนอกและเซนเซอร์
+            digitalWrite(RELAY_PIN, LOW);     // ตัดไฟวงจรภายนอกและเซนเซอร์
+            digitalWrite(LED_RED_PIN, LOW);   // ดับไฟ LED สีแดง
+            digitalWrite(LED_GREEN_PIN, LOW); // ดับไฟ LED สีเขียว
             deviceState = DEVICE_STATE_SLEEP;
-            Serial.println("[JOIN] จบ Active Phase (2 นาที) -> ตัดไฟวงจรภายนอก -> เข้าโหมด Sleep 3 นาที");
+            Serial.println("[JOIN] จบ Active Phase (45 วินาที) -> ตัดไฟวงจรภายนอก, ดับ LED -> เข้าโหมด Sleep 14.25 นาที");
         }
     }
 
-    // นับเวลา Sleep 3 นาที (180 วิ)
+    // นับเวลา Sleep 14.25 นาที (855 วิ)
     if (joinSleepPhase) {
         if (millis() - joinSleepStartTime >= JOIN_SLEEP_MS) {
             joinSleepPhase      = false;
             joinTimerStarted    = false;
             joinFallbackStarted = false;
+            digitalWrite(LED_RED_PIN, HIGH);  // เปิดไฟ LED แสดงสถานะ Active
             deviceState         = DEVICE_STATE_JOIN;
-            Serial.println("[JOIN] ครบ 3 นาที -> ตื่นจาก Sleep -> เริ่ม Cycle ใหม่อัตโนมัติ");
+            Serial.println("[JOIN] ครบ 14.25 นาที -> ตื่นจาก Sleep -> เริ่ม Cycle ใหม่อัตโนมัติ");
         }
     }
 
@@ -986,7 +989,8 @@ void loop()
 
         case DEVICE_STATE_JOIN: {
             if (!joinTimerStarted) {
-                digitalWrite(RELAY_PIN, HIGH);  // เปิดไฟเลี้ยงวงจรเซนเซอร์รอบใหม่
+                digitalWrite(RELAY_PIN, HIGH);    // เปิดไฟเลี้ยงวงจรเซนเซอร์รอบใหม่
+                digitalWrite(LED_RED_PIN, HIGH);  // เปิดไฟ LED สีแดง
                 isScreenOn = true;
                 screenTimer = millis();
                 activeStartTime = millis();
@@ -1149,7 +1153,7 @@ void loop()
                 LoRaWAN.sleep(loraWanClass);
             }
 
-            // ใน Active Phase (2 นาที): ให้หน้าจอและเซนเซอร์ทำงานต่อเนื่อง ห้ามเข้า Deep Sleep
+            // ใน Active Phase (45 วินาที): ให้หน้าจอและเซนเซอร์ทำงานต่อเนื่อง ห้ามเข้า Deep Sleep
             if (isActivePhase) {
                 if (millis() - activeStartTime >= ACTIVE_DURATION) {
                     isActivePhase    = false;
@@ -1158,8 +1162,10 @@ void loop()
                     oled.ssd1306_command(SSD1306_DISPLAYOFF);
                     currentStatus    = "Sleep";
                     screenTimer      = millis();
-                    digitalWrite(RELAY_PIN, LOW);   // ตัดไฟวงจรภายนอกและเซนเซอร์
-                    Serial.println("=== สิ้นสุด Active Phase (2 นาที) -> ดับจอ, ตัดไฟวงจรเซนเซอร์ -> เริ่ม Sleep 3 นาที ===");
+                    digitalWrite(RELAY_PIN, LOW);     // ตัดไฟวงจรภายนอกและเซนเซอร์
+                    digitalWrite(LED_RED_PIN, LOW);   // ดับไฟ LED สีแดง
+                    digitalWrite(LED_GREEN_PIN, LOW); // ดับไฟ LED สีเขียว
+                    Serial.println("=== สิ้นสุด Active Phase (45 วินาที) -> ดับจอ, ตัดไฟวงจรเซนเซอร์, ดับ LED -> เริ่ม Sleep 14.25 นาที ===");
                 } else {
                     if (millis() - lastDisplayUpdate > 1000) {
                         lastDisplayUpdate = millis();
@@ -1169,12 +1175,13 @@ void loop()
                 break;
             }
 
-            // พ้น 2 นาทีแล้ว จึงเข้าสู่ Deep Sleep สำหรับเวลาที่เหลือ (~3 นาที)
+            // พ้น 45 วินาทีแล้ว จึงเข้าสู่ Deep Sleep สำหรับเวลาที่เหลือ (~14.25 นาที)
             LoRaWAN.sleep(loraWanClass);
 
             // ปุ่ม PRG ปลุกจอชั่วคราว
             if (digitalRead(BUTTON_PIN) == LOW) {
                 digitalWrite(RELAY_PIN, HIGH);
+                digitalWrite(LED_RED_PIN, HIGH);
                 isScreenOn      = true;
                 isActivePhase   = true;
                 sensorTaskActive = true;
