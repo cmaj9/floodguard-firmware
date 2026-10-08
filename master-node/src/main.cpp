@@ -64,6 +64,11 @@ DeviceClass_t   loraWanClass  = CLASS_A;
 //    - 30 วินาที = 30000UL ms
 #define ACTIVE_DURATION      45000UL     // << [แก้เวลาตื่นที่นี่] (มิลลิวินาที)
 
+//  จุดที่ 3: กำหนดเวลาเปิดหน้าจอ OLED (Screen On Duration)
+//    - กำหนดเวลาเปิดหน้าจอ OLED ให้ผู้ใช้ตรวจดูค่า (25 วินาที = 25000UL ms) ก่อนจะดับจอเพื่อประหยัดแบตเตอรี่
+//    - การดับจอที่เวลานี้ จะไม่มีผลกระทบต่อรอบเวลาทำงาน 1 cycle (Relay เลี้ยงเซนเซอร์ และ LoRaWAN ยังทำงานครบ 45 วิตามปกติ)
+#define SCREEN_ON_DURATION_MS 25000UL    // << [แก้เวลาเปิดหน้าจอที่นี่] (มิลลิวินาที)
+
 // ------------------------------------------------------------------------------
 //  ตัวแปรระบบ (คำนวณเวลานอน Sleep ให้อัตโนมัติจาก 2 ค่าด้านบน ไม่ต้องแก้ไขเอง):
 //    - เวลานอน Sleep = TOTAL_CYCLE_MS - ACTIVE_DURATION (เช่น 600,000 - 45,000 = 555,000 ms หรือ 9.25 นาที)
@@ -99,7 +104,7 @@ unsigned long screenTimer        = 0;
 unsigned long lastDisplayUpdate  = 0;
 bool          isActivePhase      = false;
 
-const unsigned long SCREEN_TIMEOUT = 20000;
+const unsigned long SCREEN_TIMEOUT = SCREEN_ON_DURATION_MS;
 
 // ================= Hardware Config =================
 #define RELAY_PIN     26    // สวิตช์ MOSFET ควบคุมไฟวงจรภายนอก (HIGH=เปิด, LOW=ตัดไฟ)
@@ -1315,6 +1320,14 @@ void loop()
 
             // ใน Active Phase (45 วินาที): ให้หน้าจอและเซนเซอร์ทำงานต่อเนื่อง ห้ามเข้า Deep Sleep
             if (isActivePhase) {
+                // ดับหน้าจอ OLED เมื่อถึงเวลา SCREEN_ON_DURATION_MS (25 วินาที) เพื่อประหยัดแบตเตอรี่
+                // แต่วงจรเซนเซอร์, Relay และการส่งข้อมูล LoRaWAN ยังคงทำงานต่อไปจนครบ 45 วินาที (1 Cycle) ตามปกติ
+                if (isScreenOn && (millis() - activeStartTime >= SCREEN_ON_DURATION_MS)) {
+                    isScreenOn = false;
+                    oled.ssd1306_command(SSD1306_DISPLAYOFF);
+                    Serial.println("=== ดับหน้าจอ OLED (ครบ 25 วินาที) เพื่อประหยัดพลังงาน | วงจรเซนเซอร์ยังทำงานใน 1 Cycle ===");
+                }
+
                 if (millis() - activeStartTime >= ACTIVE_DURATION) {
                     isActivePhase    = false;
                     isScreenOn       = false;
@@ -1329,7 +1342,7 @@ void loop()
                                   (unsigned long)(ACTIVE_DURATION / 1000UL),
                                   (float)(appTxDutyCycle - ACTIVE_DURATION) / 60000.0f);
                 } else {
-                    if (millis() - lastDisplayUpdate > 1000) {
+                    if (isScreenOn && millis() - lastDisplayUpdate > 1000) {
                         lastDisplayUpdate = millis();
                         updateDisplay();
                     }
