@@ -1,6 +1,6 @@
 /*
  * HELTEC V3 LoRaWAN - MASTER DEPLOYMENT MODE (ESP32-C3 Sensor Bridge)
- * 1. ส่ง LoRaWAN ทุกๆ 15 นาที พร้อมเวลานับถอยหลังบนจอ
+ * 1. ส่ง LoRaWAN ทุกๆ 10 นาที พร้อมเวลานับถอยหลังบนจอ
  * 2. GPS (UART) + Direct RMC Parser -> ฝัง Unix Epoch Timestamp ถาวรใน Payload ไบต์ 22-25
  * 3. หน้าจอ OLED ปิดอัตโนมัติเมื่อเข้าสู่ Sleep (ปลุกด้วยปุ่ม PRG)
  * 4. ระดับน้ำ (ultrasonic) + Gyro: รับค่าจาก ESP32-C3 ผ่าน UART (REQ/ACK)
@@ -47,8 +47,33 @@ uint16_t userChannelsMask[6] = {0x0002, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000};
 LoRaMacRegion_t loraWanRegion = ACTIVE_REGION;
 DeviceClass_t   loraWanClass  = CLASS_A;
 
-uint32_t appTxDutyCycle      = 900000;    // รอบ 15 นาที
-#define  ACTIVE_DURATION      45000UL     // Active phase 45 วินาที
+// ==============================================================================
+// การตั้งค่ารอบเวลาทำงาน (CYCLE) และเวลาตื่น (ACTIVE PHASE)
+// ==============================================================================
+//  จุดที่ 1: กำหนดรอบเวลารวมทั้งหมด (Total Cycle)
+//    - ส่งข้อมูลทุก 10 นาที = 600000UL ms (ค่าปัจจุบัน)
+//    - ส่งข้อมูลทุก 15 นาที = 900000UL ms
+//    - ส่งข้อมูลทุก  5 นาที = 300000UL ms
+#define TOTAL_CYCLE_MS       600000UL    // << [แก้รอบส่งทั้งหมดที่นี่] (มิลลิวินาที)
+
+//  จุดที่ 2: กำหนดเวลาตื่นทำงาน (Active Phase)
+//    เวลาที่เปิด Relay 26 เลี้ยงวงจรเซนเซอร์, เปิดหน้าจอ OLED, อ่านค่าเซนเซอร์ และส่ง LoRaWAN
+//    - 45 วินาที = 45000UL ms (ค่าปัจจุบัน)
+//    - 60 วินาที = 60000UL ms
+//    - 30 วินาที = 30000UL ms
+#define ACTIVE_DURATION      45000UL     // << [แก้เวลาตื่นที่นี่] (มิลลิวินาที)
+
+// ------------------------------------------------------------------------------
+//  ตัวแปรระบบ (คำนวณเวลานอน Sleep ให้อัตโนมัติจาก 2 ค่าด้านบน ไม่ต้องแก้ไขเอง):
+//    - เวลานอน Sleep = TOTAL_CYCLE_MS - ACTIVE_DURATION (เช่น 600,000 - 45,000 = 555,000 ms หรือ 9.25 นาที)
+// ------------------------------------------------------------------------------
+uint32_t appTxDutyCycle      = TOTAL_CYCLE_MS;
+uint32_t currentTxWait       = TOTAL_CYCLE_MS;
+#define  JOIN_CYCLE_TOTAL_MS  ACTIVE_DURATION
+#define  JOIN_SLEEP_MS        (TOTAL_CYCLE_MS - ACTIVE_DURATION)
+
+// ================= OTAA Join Control =================
+#define JOIN_ATTEMPT_TIMEOUT_MS  30000UL  // 30 วิ: ถ้า Join ไม่ติด ให้เซฟค่าลง Flash ทันที
 
 bool    overTheAirActivation = true;
 bool    loraWanAdr           = false;     // ปิด ADR เพื่อให้คงค่า DR 2 ตลอดเวลา
@@ -58,14 +83,6 @@ uint8_t confirmedNbTrials    = 1;
 
 // กำหนด DataRate ระดับโกลบอลของไลบรารีให้เป็น DR 2 (SF10)
 int8_t  loraWanDatarate      = DR_2;
-
-uint32_t currentTxWait = 900000;
-
-// ================= OTAA Join Control =================
-#define JOIN_ATTEMPT_TIMEOUT_MS  30000UL   // 30 วิ: ออฟไลน์ -> เซฟลง Flash ทันที
-#define JOIN_CYCLE_TOTAL_MS      45000UL   // 45 วิ: จบ Active Phase -> ตัดไฟ Relay เข้า Sleep
-#define JOIN_SLEEP_MS            855000UL  // 855 วิ: Sleep 14.25 นาที (45s + 855s = 15 นาที)
-#define ACTIVE_BUDGET_MS         38000UL   // เวลาโควตาสูงสุดในการส่งข้อมูลต่อรอบ (38 วิ)
 
 bool          joinTimerStarted    = false;
 unsigned long joinCycleStartTime  = 0;
@@ -136,12 +153,26 @@ uint32_t currentEpoch        = 0;
 
 bool     gpsValidCached = false;
 
-// ================= Battery =================
+// ================= Battery (LiFePO4 4S 12.8V) =================
 const float BAT_R1        = 100000.0f;
 const float BAT_R2        =  20000.0f;
 const float BAT_DIV_RATIO = (BAT_R1 + BAT_R2) / BAT_R2;
-const float BAT_EMPTY_V   = 11.0f;
-const float BAT_FULL_V    = 13.6f;
+
+// คำนวณ % แบตเตอรี่ LiFePO4 4S ด้วย OCV Piecewise Curve (11.20V - 14.00V)
+float calculateLiFePO4Percent(float v) {
+    if (v >= 13.60f) return 100.0f; // ช่วงชาร์จเต็ม หรือมีแดดชาร์จ (13.6V - 14.4V)
+    if (v >= 13.40f) return 98.0f + (v - 13.40f) * (2.0f / 0.20f);  // 13.40V = 98% (Resting Full หลังหมดแดด)
+    if (v >= 13.30f) return 90.0f + (v - 13.30f) * (8.0f / 0.10f);  // 13.30V = 90%
+    if (v >= 13.20f) return 80.0f + (v - 13.20f) * (10.0f / 0.10f); // 13.20V = 80%
+    if (v >= 13.15f) return 70.0f + (v - 13.15f) * (10.0f / 0.05f); // 13.15V = 70%
+    if (v >= 13.05f) return 50.0f + (v - 13.05f) * (20.0f / 0.10f); // 13.05V = 50%
+    if (v >= 12.95f) return 35.0f + (v - 12.95f) * (15.0f / 0.10f); // 12.95V = 35%
+    if (v >= 12.85f) return 20.0f + (v - 12.85f) * (15.0f / 0.10f); // 12.85V = 20%
+    if (v >= 12.50f) return 10.0f + (v - 12.50f) * (10.0f / 0.35f); // 12.50V = 10%
+    if (v >= 12.00f) return 5.0f  + (v - 12.00f) * (5.0f / 0.50f);  // 12.00V = 5%
+    if (v >= 11.20f) return 0.0f  + (v - 11.20f) * (5.0f / 0.80f);  // 11.20V = 0% (BMS Cutoff)
+    return 0.0f;
+}
 
 // ================= Background Sensor Task =================
 #define SENSOR_READ_INTERVAL_MS      5000
@@ -153,6 +184,7 @@ SemaphoreHandle_t sensorMutex      = NULL;
 
 volatile bool sensorTaskActive = true;
 volatile bool sensorDataReady  = false;
+extern uint16_t backlogCount;
 
 void VextON() {
     pinMode(VEXT_PIN, OUTPUT);
@@ -196,7 +228,9 @@ void updateDisplay()
     String shortStatus = currentStatus;
     if      (currentStatus == "Booting...")  shortStatus = "BOOT";
     else if (currentStatus == "Joining...")  shortStatus = "JOIN";
-    else if (currentStatus == "Sending...")  shortStatus = "SEND";
+    else if (currentStatus == "Sending...") {
+        shortStatus = (backlogCount > 0) ? "DRAN" : "SEND";
+    }
     else if (currentStatus == "Monitor...")  shortStatus = "MON";
     else if (currentStatus == "Reading...")  shortStatus = "READ";
     else if (currentStatus == "No Join...")  shortStatus = "NOJN";
@@ -212,12 +246,18 @@ void updateDisplay()
 
     oled.setCursor(98, 0);
     if (isActivePhase) {
-        unsigned long activeElapsed = millis() - activeStartTime;
-        unsigned long remain = (ACTIVE_DURATION > activeElapsed)
-                               ? (ACTIVE_DURATION - activeElapsed) / 1000 : 0;
-        char timeStr[8];
-        sprintf(timeStr, "%02d:%02d", (int)(remain / 60), (int)(remain % 60));
-        oled.print(timeStr);
+        if (backlogCount > 0 && currentStatus == "Sending...") {
+            char bkStr[8];
+            sprintf(bkStr, "B:%3d", backlogCount);
+            oled.print(bkStr);
+        } else {
+            unsigned long activeElapsed = millis() - activeStartTime;
+            unsigned long remain = (ACTIVE_DURATION > activeElapsed)
+                                   ? (ACTIVE_DURATION - activeElapsed) / 1000 : 0;
+            char timeStr[8];
+            sprintf(timeStr, "%02d:%02d", (int)(remain / 60), (int)(remain % 60));
+            oled.print(timeStr);
+        }
     } else {
         oled.print("--:--");
     }
@@ -386,9 +426,11 @@ void buildSensorPayload(uint8_t *out26)
         xSemaphoreGive(sensorMutex);
     }
 
-    if (epochLocal <= 1700000000) {
-        time_t now = time(nullptr);
-        if (now > 1700000000) epochLocal = (uint32_t)now;
+    time_t now = time(nullptr);
+    if (now > 1700000000) {
+        epochLocal = (uint32_t)now;
+    } else if (epochLocal <= 1700000000) {
+        epochLocal = 0;
     }
 
     uint16_t water_level = (uint16_t)(lvlLocal * 10);
@@ -746,7 +788,7 @@ void readSensorsQuick()
                            : (currentAvgVoltage * 0.10f) + (smoothedVoltageLocal * 0.90f);
 
     float battVoltLocal = smoothedVoltageLocal + calibrationOffset;
-    float percent = ((battVoltLocal - BAT_EMPTY_V) / (BAT_FULL_V - BAT_EMPTY_V)) * 100.0f;
+    float percent       = calculateLiFePO4Percent(battVoltLocal);
     int   battPctLocal  = (int)(constrain(percent, 0.0f, 100.0f) + 0.5f);
 
     // 3. ESP32-C3
@@ -927,15 +969,20 @@ void loop()
             updateDisplay();
             Serial.println("[JOIN] 30s Timeout -> Gateway ออฟไลน์: บันทึกข้อมูลสะสมลง Flash ทันที");
 
-            if (sensorDataReady) {
-                uint8_t payload26[PAYLOAD_TOTAL_SIZE];
-                buildSensorPayload(payload26);
-                appendPacketToFlash(payload26);
+            if (!sensorDataReady) {
+                unsigned long wStart = millis();
+                while (!sensorDataReady && millis() - wStart < 3000) {
+                    delay(50);
+                }
             }
+
+            uint8_t payload26[PAYLOAD_TOTAL_SIZE];
+            buildSensorPayload(payload26);
+            appendPacketToFlash(payload26);
             sensorTaskActive = false;
         }
 
-        // ครบ 45 วินาที: จบ Active Phase -> ดับจอ, ตัดไฟ Relay ขา 26, ดับ LED, เข้าสู่ Sleep 14.25 นาที
+        // ครบ 45 วินาที: จบ Active Phase -> ดับจอ, ตัดไฟ Relay ขา 26, ดับ LED, เข้าสู่ Sleep 9.25 นาที
         if (jElapsed >= JOIN_CYCLE_TOTAL_MS) {
             joinSleepPhase     = true;
             joinSleepStartTime = millis();
@@ -949,19 +996,23 @@ void loop()
             digitalWrite(LED_RED_PIN, LOW);   // ดับไฟ LED สีแดง
             digitalWrite(LED_GREEN_PIN, LOW); // ดับไฟ LED สีเขียว
             deviceState = DEVICE_STATE_SLEEP;
-            Serial.println("[JOIN] จบ Active Phase (45 วินาที) -> ตัดไฟวงจรภายนอก, ดับ LED -> เข้าโหมด Sleep 14.25 นาที");
+            Serial.printf("[JOIN] จบ Active Phase (%lu s) -> ตัดไฟวงจรภายนอก, ดับ LED -> เข้าโหมด Sleep (%.2f นาที)\n",
+                          (unsigned long)(ACTIVE_DURATION / 1000UL),
+                          (float)(JOIN_SLEEP_MS) / 60000.0f);
         }
     }
 
-    // นับเวลา Sleep 14.25 นาที (855 วิ)
+    // นับเวลา Sleep เมื่อ Gateway ออฟไลน์
     if (joinSleepPhase) {
         if (millis() - joinSleepStartTime >= JOIN_SLEEP_MS) {
             joinSleepPhase      = false;
             joinTimerStarted    = false;
             joinFallbackStarted = false;
+            sensorDataReady     = false;
             digitalWrite(LED_RED_PIN, HIGH);  // เปิดไฟ LED แสดงสถานะ Active
             deviceState         = DEVICE_STATE_JOIN;
-            Serial.println("[JOIN] ครบ 14.25 นาที -> ตื่นจาก Sleep -> เริ่ม Cycle ใหม่อัตโนมัติ");
+            Serial.printf("[JOIN] ครบระยะ Sleep (%.2f นาที) -> ตื่นจาก Sleep -> เริ่มรอบใหม่อัตโนมัติ\n",
+                          (float)(JOIN_SLEEP_MS) / 60000.0f);
         }
     }
 
@@ -971,6 +1022,7 @@ void loop()
         joinTimerStarted    = false;
         joinFallbackStarted = false;
         joinSleepPhase      = false;
+        sensorDataReady     = false;
         sensorTaskActive    = true;
     }
 
@@ -1000,6 +1052,7 @@ void loop()
                 joinCycleStartTime  = millis();
                 joinTimerStarted    = true;
                 joinFallbackStarted = false;
+                sensorDataReady     = false;
                 sensorTaskActive    = true;
                 saveFCnt(0);
 
@@ -1025,6 +1078,7 @@ void loop()
 
             activeStartTime  = millis();
             isActivePhase    = true;
+            sensorDataReady  = false;
             sensorTaskActive = true;
 
             currentStatus = "Sending...";
@@ -1039,11 +1093,13 @@ void loop()
             }
             digitalWrite(LED_GREEN_PIN, HIGH);
 
-            // 2. ทยอยส่ง Backlog จาก Flash พร้อมระบบ Retry 2 ครั้งต่อแพ็กเก็ต
-            if (backlogCount > 0) {
-                Serial.printf("[MODE] ต่อ Gateway ติด! กำลังทยอยส่ง Backlog ย้อนหลัง %d packet...\n", backlogCount);
+            // 2. ระบาย Backlog จาก Flash ต่อเนื่องจนหมดคิว (Burst FIFO)
+            bool allBacklogSent = true;
 
-                while (backlogCount > 0 && (millis() - activeStartTime) < ACTIVE_BUDGET_MS) {
+            if (backlogCount > 0) {
+                Serial.printf("[MODE] ต่อ Gateway ติด! กำลังระบาย Backlog ย้อนหลังต่อเนื่อง %d packet...\n", backlogCount);
+
+                while (backlogCount > 0) {
                     bool acked = false;
 
                     // ลองส่งแพ็กเก็ตเดิมได้สูงสุด 2 ครั้ง หากไม่ได้ ACK
@@ -1064,58 +1120,56 @@ void loop()
                         Serial.printf("[BACKLOG] ส่งสำเร็จ 1 packet (คงเหลือ %d packet)\n", backlogCount);
                         updateDisplay();
 
-                        if (backlogCount > 0 && (millis() - activeStartTime) < ACTIVE_BUDGET_MS) {
-                            delay(BACKLOG_SEND_SPACING_MS); // เว้นระยะ 4 วินาทีระหว่างแพ็กเก็ต
+                        if (backlogCount > 0) {
+                            delay(BACKLOG_SEND_SPACING_MS); // เว้นระยะ 3 วินาทีระหว่างแพ็กเก็ต
                         }
                     } else {
-                        Serial.println("[BACKLOG] NACK ครบ 2 ครั้ง (สัญญาณขาดจริง) → หยุดส่ง Backlog รอบนี้");
+                        Serial.println("[BACKLOG] NACK ครบ 2 ครั้ง (สัญญาณขาดจริง) → บันทึกค้างใน Flash แล้วหยุดส่งทันที");
+                        allBacklogSent = false;
                         break;
                     }
                 }
             }
 
-            // 3. จัดการกรณี Backlog หมด หรือส่งไม่หมด
-            if (backlogCount == 0) {
-                if (LittleFS.exists(FLASH_BACKLOG_FILE)) {
-                    LittleFS.remove(FLASH_BACKLOG_FILE);
-                    Serial.println("[FLASH] ส่ง Backlog ย้อนหลังครบทั้งหมดแล้ว -> ลบไฟล์ Flash เรียบร้อย");
-                }
-
-                Serial.println("[SEND] Backlog ว่างแล้ว -> เตรียมอ่านและส่งข้อมูลรอบปัจจุบัน...");
-                if (!sensorDataReady) {
-                    unsigned long waitStart = millis();
-                    while (!sensorDataReady && millis() - waitStart < SENSOR_FIRST_READ_TIMEOUT_MS) {
-                        delay(50);
-                    }
-                }
-
-                uint8_t currentPayload[PAYLOAD_TOTAL_SIZE];
-                buildSensorPayload(currentPayload);
-
-                saveNextFCntBeforeSend();
-                bool curAcked = sendConfirmedAndWait(currentPayload, PAYLOAD_TOTAL_SIZE, CONFIRMED_ACK_TIMEOUT_MS);
-                if (curAcked) {
-                    Serial.println("[SEND] ส่งข้อมูลรอบปัจจุบันสำเร็จ!");
-                } else {
-                    Serial.println("[SEND] ส่งข้อมูลปัจจุบันไม่สำเร็จ (NACK) -> บันทึกลง Flash รอส่งรอบหน้า");
-                    appendPacketToFlash(currentPayload);
-                }
-            } else {
-                Serial.printf("[SEND] ส่ง Backlog ยังไม่หมด (ค้าง %d packet) -> บันทึกค่าปัจจุบันรอบนี้เพิ่มเข้า Flash\n", backlogCount);
-
-                if (!sensorDataReady) {
-                    unsigned long waitStart = millis();
-                    while (!sensorDataReady && millis() - waitStart < SENSOR_FIRST_READ_TIMEOUT_MS) {
-                        delay(50);
-                    }
-                }
-
-                uint8_t currentPayload[PAYLOAD_TOTAL_SIZE];
-                buildSensorPayload(currentPayload);
-                enqueueBacklog(currentPayload);
-
+            // 3. จัดการกรณี Backlog ส่งไม่หมด (NACK 2 ครั้ง) หรือ Backlog หมดแล้ว
+            if (!allBacklogSent) {
+                // หากยังส่งข้อมูลเก่าไม่หมด ห้ามส่งข้อมูลปัจจุบันเด็ดขาด!
+                // บันทึก backlog ที่เหลือลง Flash แล้วตัดเข้าสู่ Sleep ทันที เพื่อรอเริ่มใหม่ในรอบหน้า
                 saveRemainingBacklogToFlash();
-                Serial.printf("[SEND] บันทึกลง Flash สำเร็จ รวมข้อมูลตกค้างทั้งหมด: %d packet\n", backlogCount);
+                Serial.printf("[BACKLOG] NACK ขาดการเชื่อมต่อ -> พักเข้าสู่ Sleep รอบใหม่ (เหลือค้าง %d packet)\n", backlogCount);
+                deviceState = DEVICE_STATE_CYCLE;
+                break;
+            }
+
+            // เมื่อ Backlog หมดแล้ว (backlogCount == 0) ลบไฟล์ Flash ทิ้งทันที
+            if (LittleFS.exists(FLASH_BACKLOG_FILE)) {
+                LittleFS.remove(FLASH_BACKLOG_FILE);
+                Serial.println("[FLASH] ส่ง Backlog ย้อนหลังครบทั้งหมดแล้ว -> ลบไฟล์ Flash เรียบร้อย");
+            }
+
+            // รีเซ็ต activeStartTime ใหม่ เพื่อให้นับถอยหลัง 45 วินาทีเต็มสำหรับข้อมูลรอบปัจจุบัน!
+            activeStartTime = millis();
+            isActivePhase   = true;
+
+            // ส่งข้อมูลรอบปัจจุบันเฉพาะเมื่อ Backlog หมดแล้วเท่านั้น!
+            Serial.println("[SEND] Backlog ว่างแล้ว -> เตรียมอ่านและส่งข้อมูลรอบปัจจุบัน...");
+            if (!sensorDataReady) {
+                unsigned long waitStart = millis();
+                while (!sensorDataReady && millis() - waitStart < SENSOR_FIRST_READ_TIMEOUT_MS) {
+                    delay(50);
+                }
+            }
+
+            uint8_t currentPayload[PAYLOAD_TOTAL_SIZE];
+            buildSensorPayload(currentPayload);
+
+            saveNextFCntBeforeSend();
+            bool curAcked = sendConfirmedAndWait(currentPayload, PAYLOAD_TOTAL_SIZE, CONFIRMED_ACK_TIMEOUT_MS);
+            if (curAcked) {
+                Serial.println("[SEND] ส่งข้อมูลรอบปัจจุบันสำเร็จ!");
+            } else {
+                Serial.println("[SEND] ส่งข้อมูลปัจจุบันไม่สำเร็จ (NACK) -> บันทึกลง Flash รอส่งรอบหน้า");
+                appendPacketToFlash(currentPayload);
             }
 
             delay(1000);
@@ -1139,6 +1193,7 @@ void loop()
             screenTimer     = millis();
             oled.ssd1306_command(SSD1306_DISPLAYON);
             currentStatus    = "Monitor...";
+            sensorDataReady  = false;
             sensorTaskActive = true;
 
             LoRaWAN.cycle(txDutyCycleTime);
@@ -1165,7 +1220,9 @@ void loop()
                     digitalWrite(RELAY_PIN, LOW);     // ตัดไฟวงจรภายนอกและเซนเซอร์
                     digitalWrite(LED_RED_PIN, LOW);   // ดับไฟ LED สีแดง
                     digitalWrite(LED_GREEN_PIN, LOW); // ดับไฟ LED สีเขียว
-                    Serial.println("=== สิ้นสุด Active Phase (45 วินาที) -> ดับจอ, ตัดไฟวงจรเซนเซอร์, ดับ LED -> เริ่ม Sleep 14.25 นาที ===");
+                    Serial.printf("=== สิ้นสุด Active Phase (%lu s) -> ดับจอ, ตัดไฟวงจรเซนเซอร์, ดับ LED -> เริ่ม Sleep (%.2f นาที) ===\n",
+                                  (unsigned long)(ACTIVE_DURATION / 1000UL),
+                                  (float)(appTxDutyCycle - ACTIVE_DURATION) / 60000.0f);
                 } else {
                     if (millis() - lastDisplayUpdate > 1000) {
                         lastDisplayUpdate = millis();
@@ -1175,7 +1232,7 @@ void loop()
                 break;
             }
 
-            // พ้น 45 วินาทีแล้ว จึงเข้าสู่ Deep Sleep สำหรับเวลาที่เหลือ (~14.25 นาที)
+            // พ้น 45 วินาทีแล้ว จึงเข้าสู่ Deep Sleep สำหรับเวลาที่เหลือ (~9.25 นาที)
             LoRaWAN.sleep(loraWanClass);
 
             // ปุ่ม PRG ปลุกจอชั่วคราว
