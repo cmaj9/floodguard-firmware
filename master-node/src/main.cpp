@@ -25,6 +25,7 @@
 #include <LittleFS.h>
 #include <time.h>
 #include <sys/time.h>
+#include "esp_sleep.h"
 
 // ================= LoRaWAN Config (OTAA) =================
 #if __has_include("credentials.h")
@@ -109,6 +110,12 @@ const unsigned long SCREEN_TIMEOUT = 20000;
 #define OLED_RESET    21
 #define VEXT_PIN      36
 #define BUTTON_PIN    0
+
+volatile bool prgButtonPressed = false;
+void IRAM_ATTR prgButtonISR()
+{
+    prgButtonPressed = true;
+}
 
 Adafruit_SSD1306 oled(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 bool isScreenOn = true;
@@ -894,6 +901,7 @@ void setup()
     digitalWrite(LED_RED_PIN,  HIGH);
     digitalWrite(LED_GREEN_PIN, LOW);
     pinMode(BUTTON_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), prgButtonISR, FALLING);
     screenTimer = millis();
 
     overTheAirActivation = true;
@@ -1208,6 +1216,24 @@ void loop()
 
         case DEVICE_STATE_SLEEP: {
 
+            esp_sleep_wakeup_cause_t wakeupReason = esp_sleep_get_wakeup_cause();
+            if (prgButtonPressed || digitalRead(BUTTON_PIN) == LOW || 
+                wakeupReason == ESP_SLEEP_WAKEUP_EXT0 || wakeupReason == ESP_SLEEP_WAKEUP_GPIO) {
+                prgButtonPressed = false;
+                digitalWrite(RELAY_PIN, HIGH);
+                digitalWrite(LED_RED_PIN, HIGH);
+                isScreenOn       = true;
+                isActivePhase    = true;
+                sensorTaskActive = true;
+                activeStartTime  = millis();
+                screenTimer      = millis();
+                oled.ssd1306_command(SSD1306_DISPLAYON);
+                currentStatus    = "Monitor...";
+                Serial.println("=== กดปุ่ม PRG -> ปลุกจอและจ่ายไฟวงจรชั่วคราว ===");
+                updateDisplay();
+                delay(200);
+            }
+
             // ปั๊ม Radio เฉพาะตอนรอ Join-Accept เท่านั้น
             if (joinTimerStarted && !joinSleepPhase) {
                 LoRaWAN.sleep(loraWanClass);
@@ -1238,22 +1264,11 @@ void loop()
             }
 
             // พ้น 45 วินาทีแล้ว จึงเข้าสู่ Deep Sleep สำหรับเวลาที่เหลือ (~9.25 นาที)
-            LoRaWAN.sleep(loraWanClass);
+            // เปิดใช้งาน hardware wake-up ผ่านปุ่ม PRG (GPIO 0)
+            esp_sleep_enable_ext0_wakeup((gpio_num_t)BUTTON_PIN, 0);
+            Mcu.addwakeio((uint8_t)BUTTON_PIN);
 
-            // ปุ่ม PRG ปลุกจอชั่วคราว
-            if (digitalRead(BUTTON_PIN) == LOW) {
-                digitalWrite(RELAY_PIN, HIGH);
-                digitalWrite(LED_RED_PIN, HIGH);
-                isScreenOn      = true;
-                isActivePhase   = true;
-                sensorTaskActive = true;
-                activeStartTime = millis();
-                screenTimer     = millis();
-                oled.ssd1306_command(SSD1306_DISPLAYON);
-                currentStatus = "Monitor...";
-                Serial.println("=== กดปุ่ม PRG -> ปลุกจอและจ่ายไฟวงจรชั่วคราว ===");
-                delay(200);
-            }
+            LoRaWAN.sleep(loraWanClass);
 
             if (isScreenOn && millis() - screenTimer > SCREEN_TIMEOUT) {
                 oled.ssd1306_command(SSD1306_DISPLAYOFF);
