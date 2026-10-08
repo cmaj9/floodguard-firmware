@@ -83,6 +83,8 @@ uint8_t confirmedNbTrials    = 1;
 
 // กำหนด DataRate ระดับโกลบอลของไลบรารีให้เป็น DR 2 (SF10)
 int8_t  loraWanDatarate      = DR_2;
+extern int8_t defaultDrForNoAdr;
+extern int8_t currentDrForNoAdr;
 
 bool          joinTimerStarted    = false;
 unsigned long joinCycleStartTime  = 0;
@@ -620,14 +622,22 @@ bool sendConfirmedAndWait(const uint8_t *payload, uint8_t size, uint32_t ackTime
     lastConfirmedAcked = false;
     waitingForAck        = true;
 
-    // บังคับส่งด้วย DR 2 (SF10) ทุกครั้งเพื่อความเสถียรของหน้าต่าง RX
+    // บังคับล็อค DataRate ให้เป็น DR 2 (SF10) ทุกตัวแปรในไลบรารี Heltec และ LoRaMac
+    LoRaWAN.setDefaultDR(DR_2);
+    defaultDrForNoAdr = DR_2;
+    currentDrForNoAdr = DR_2;
+
     MibRequestConfirm_t mibReq;
     mibReq.Type = MIB_CHANNELS_DATARATE;
     mibReq.Param.ChannelsDatarate = DR_2;
     LoRaMacMibSetRequestConfirm(&mibReq);
 
+    mibReq.Type = MIB_CHANNELS_DEFAULT_DATARATE;
+    mibReq.Param.ChannelsDefaultDatarate = DR_2;
+    LoRaMacMibSetRequestConfirm(&mibReq);
+
     LoRaWAN.send();
-    Serial.printf("[LORAWAN] ส่ง uplink (%d bytes) รอ ACK...\n", size);
+    Serial.printf("[LORAWAN] ส่ง uplink (%d bytes) ที่ DR %d รอ ACK...\n", size, currentDrForNoAdr);
 
     unsigned long waitStart = millis();
     while (waitingForAck && (millis() - waitStart) < ackTimeoutMs) {
@@ -1036,6 +1046,9 @@ void loop()
                 LoRaWAN.generateDeveuiByChipID();
             #endif
             LoRaWAN.init(loraWanClass, loraWanRegion);
+            LoRaWAN.setDefaultDR(DR_2);
+            defaultDrForNoAdr = DR_2;
+            currentDrForNoAdr = DR_2;
             break;
         }
 
@@ -1070,10 +1083,25 @@ void loop()
             digitalWrite(RELAY_PIN, HIGH);
 
             // หน่วงเวลา 4 วินาทีหลัง Join สำเร็จ เพื่อให้ Gateway & Network Server พร้อมรับ Uplink
-            Serial.println("[SEND] รอ Gateway ตั้งค่า Session ให้เสร็จสมบูรณ์ (4 วินาที)...");
-            delay(4000);
+            Serial.println("[SEND] เตรียมอ่านเซนเซอร์และตรวจสอบความพร้อม...");
+            delay(2000);
 
-            // 1. โหลดข้อมูลตกค้างทั้งหมดจาก Flash เข้า RAM
+            // 1. อ่านค่าเซนเซอร์รอบปัจจุบันก่อนเสมอ (รับประกันว่าข้อมูลรอบนี้ถูกอ่านและแปลงเป็นแพ็กเก็ตแน่นอน ไม่สูญหาย)
+            if (!sensorDataReady) {
+                unsigned long waitStart = millis();
+                while (!sensorDataReady && millis() - waitStart < SENSOR_FIRST_READ_TIMEOUT_MS) {
+                    delay(50);
+                }
+            }
+
+            uint8_t currentPayload[PAYLOAD_TOTAL_SIZE];
+            buildSensorPayload(currentPayload);
+
+            // 2. บันทึกข้อมูลปัจจุบันต่อท้ายคิว Flash ทันที (FIFO Safe: บันทึกลงหน่วยความจำก่อนส่งเสมอ ป้องกันข้อมูลหลุด)
+            appendPacketToFlash(currentPayload);
+            Serial.println("[SEND] บันทึกข้อมูลรอบปัจจุบันต่อท้ายคิว Flash สำเร็จ (FIFO Safe)");
+
+            // 3. โหลดคิวทั้งหมด (ข้อมูลเก่าสะสม + ข้อมูลปัจจุบันล่าสุด) จาก Flash เข้าสู่ RAM
             loadBacklogFromFlash();
 
             activeStartTime  = millis();
@@ -1093,11 +1121,11 @@ void loop()
             }
             digitalWrite(LED_GREEN_PIN, HIGH);
 
-            // 2. ระบาย Backlog จาก Flash ต่อเนื่องจนหมดคิว (Burst FIFO)
+            // 4. ระบายคิวทั้งหมดจากเก่าสุด (หัวแถว) ไปใหม่สุด (ท้ายแถว) อย่างต่อเนื่อง
             bool allBacklogSent = true;
 
             if (backlogCount > 0) {
-                Serial.printf("[MODE] ต่อ Gateway ติด! กำลังระบาย Backlog ย้อนหลังต่อเนื่อง %d packet...\n", backlogCount);
+                Serial.printf("[MODE] กำลังส่งข้อมูลสะสมต่อเนื่องทั้งหมด %d packet (เรียงจากเก่าไปใหม่)...\n", backlogCount);
 
                 while (backlogCount > 0) {
                     bool acked = false;
@@ -1117,7 +1145,7 @@ void loop()
 
                     if (acked) {
                         dequeueBacklog();
-                        Serial.printf("[BACKLOG] ส่งสำเร็จ 1 packet (คงเหลือ %d packet)\n", backlogCount);
+                        Serial.printf("[BACKLOG] ส่งสำเร็จ 1 packet (คงเหลือในคิว %d packet)\n", backlogCount);
                         updateDisplay();
 
                         if (backlogCount > 0) {
@@ -1131,45 +1159,22 @@ void loop()
                 }
             }
 
-            // 3. จัดการกรณี Backlog ส่งไม่หมด (NACK 2 ครั้ง) หรือ Backlog หมดแล้ว
+            // 5. จัดการผลลัพธ์หลังเสร็จสิ้นการส่ง
             if (!allBacklogSent) {
-                // หากยังส่งข้อมูลเก่าไม่หมด ห้ามส่งข้อมูลปัจจุบันเด็ดขาด!
-                // บันทึก backlog ที่เหลือลง Flash แล้วตัดเข้าสู่ Sleep ทันที เพื่อรอเริ่มใหม่ในรอบหน้า
+                // หาก NACK 2 ครั้ง บันทึกแพ็กเก็ตที่เหลือทั้งหมด (รวมข้อมูลรอบปัจจุบันหากยังส่งไปไม่ถึง) ค้างไว้ใน Flash ต่อไป
                 saveRemainingBacklogToFlash();
-                Serial.printf("[BACKLOG] NACK ขาดการเชื่อมต่อ -> พักเข้าสู่ Sleep รอบใหม่ (เหลือค้าง %d packet)\n", backlogCount);
-                deviceState = DEVICE_STATE_CYCLE;
-                break;
-            }
-
-            // เมื่อ Backlog หมดแล้ว (backlogCount == 0) ลบไฟล์ Flash ทิ้งทันที
-            if (LittleFS.exists(FLASH_BACKLOG_FILE)) {
-                LittleFS.remove(FLASH_BACKLOG_FILE);
-                Serial.println("[FLASH] ส่ง Backlog ย้อนหลังครบทั้งหมดแล้ว -> ลบไฟล์ Flash เรียบร้อย");
-            }
-
-            // รีเซ็ต activeStartTime ใหม่ เพื่อให้นับถอยหลัง 45 วินาทีเต็มสำหรับข้อมูลรอบปัจจุบัน!
-            activeStartTime = millis();
-            isActivePhase   = true;
-
-            // ส่งข้อมูลรอบปัจจุบันเฉพาะเมื่อ Backlog หมดแล้วเท่านั้น!
-            Serial.println("[SEND] Backlog ว่างแล้ว -> เตรียมอ่านและส่งข้อมูลรอบปัจจุบัน...");
-            if (!sensorDataReady) {
-                unsigned long waitStart = millis();
-                while (!sensorDataReady && millis() - waitStart < SENSOR_FIRST_READ_TIMEOUT_MS) {
-                    delay(50);
-                }
-            }
-
-            uint8_t currentPayload[PAYLOAD_TOTAL_SIZE];
-            buildSensorPayload(currentPayload);
-
-            saveNextFCntBeforeSend();
-            bool curAcked = sendConfirmedAndWait(currentPayload, PAYLOAD_TOTAL_SIZE, CONFIRMED_ACK_TIMEOUT_MS);
-            if (curAcked) {
-                Serial.println("[SEND] ส่งข้อมูลรอบปัจจุบันสำเร็จ!");
+                Serial.printf("[BACKLOG] NACK ขาดการเชื่อมต่อ -> เซฟคิวที่เหลือลง Flash แล้วตัดเข้า Sleep รอบใหม่ (เหลือค้าง %d packet)\n", backlogCount);
             } else {
-                Serial.println("[SEND] ส่งข้อมูลปัจจุบันไม่สำเร็จ (NACK) -> บันทึกลง Flash รอส่งรอบหน้า");
-                appendPacketToFlash(currentPayload);
+                // เมื่อส่งสำเร็จครบถ้วนทุกรายการ (backlogCount == 0) ลบไฟล์ Flash ทิ้งทันที
+                if (LittleFS.exists(FLASH_BACKLOG_FILE)) {
+                    LittleFS.remove(FLASH_BACKLOG_FILE);
+                    Serial.println("[FLASH] ส่งข้อมูลครบทั้งหมดแล้ว -> ลบไฟล์ Flash สำเร็จ");
+                }
+                Serial.println("[SEND] ส่งข้อมูลสำเร็จครบถ้วนทุกรายการ (คิวว่าง 0 packet)!");
+
+                // รีเซ็ต activeStartTime ใหม่ เพื่อให้นับถอยหลัง 45 วินาทีเต็ม แสดงผลข้อมูลบนหน้าจอ OLED
+                activeStartTime = millis();
+                isActivePhase   = true;
             }
 
             delay(1000);
