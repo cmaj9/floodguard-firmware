@@ -167,6 +167,10 @@ const float BAT_R1        = 100000.0f;
 const float BAT_R2        =  20000.0f;
 const float BAT_DIV_RATIO = (BAT_R1 + BAT_R2) / BAT_R2;
 
+// RTC Memory: คงค่าไว้ข้าม Deep Sleep ไม่หายไปหลังหลับ 9.25 นาที และไม่ทำให้ Flash เสื่อม
+RTC_DATA_ATTR float rtcLastStableBattPct = -1.0f;
+bool newCycleSoCAllowed = true;
+
 // คำนวณ % แบตเตอรี่ LiFePO4 4S ด้วย OCV Piecewise Curve (11.20V - 14.00V)
 float calculateLiFePO4Percent(float v) {
     if (v >= 13.60f) return 100.0f; // ช่วงชาร์จเต็ม หรือมีแดดชาร์จ (13.6V - 14.4V)
@@ -174,13 +178,87 @@ float calculateLiFePO4Percent(float v) {
     if (v >= 13.30f) return 90.0f + (v - 13.30f) * (8.0f / 0.10f);  // 13.30V = 90%
     if (v >= 13.20f) return 80.0f + (v - 13.20f) * (10.0f / 0.10f); // 13.20V = 80%
     if (v >= 13.15f) return 70.0f + (v - 13.15f) * (10.0f / 0.05f); // 13.15V = 70%
-    if (v >= 13.05f) return 50.0f + (v - 13.05f) * (20.0f / 0.10f); // 13.05V = 50%
+    if (v >= 13.10f) return 60.0f + (v - 13.10f) * (10.0f / 0.05f); // 13.10V = 60% (เกลี่ย Plateau)
+    if (v >= 13.05f) return 50.0f + (v - 13.05f) * (10.0f / 0.05f); // 13.05V = 50%
     if (v >= 12.95f) return 35.0f + (v - 12.95f) * (15.0f / 0.10f); // 12.95V = 35%
     if (v >= 12.85f) return 20.0f + (v - 12.85f) * (15.0f / 0.10f); // 12.85V = 20%
     if (v >= 12.50f) return 10.0f + (v - 12.50f) * (10.0f / 0.35f); // 12.50V = 10%
     if (v >= 12.00f) return 5.0f  + (v - 12.00f) * (5.0f / 0.50f);  // 12.00V = 5%
     if (v >= 11.20f) return 0.0f  + (v - 11.20f) * (5.0f / 0.80f);  // 11.20V = 0% (BMS Cutoff)
     return 0.0f;
+}
+
+// ฟังก์ชันอ่านค่าแรงดันแบตเตอรี่แบบ Oversampling (31 samples, Median/Mean Trimmed)
+float readRawBatteryVoltage() {
+    int samples[31];
+    for (int i = 0; i < 31; i++) {
+        samples[i] = analogReadMilliVolts(CUSTOM_BAT_PIN);
+        delay(2);
+    }
+    for (int i = 0; i < 30; i++) {
+        for (int j = i + 1; j < 31; j++) {
+            if (samples[i] > samples[j]) {
+                int tmp = samples[i];
+                samples[i] = samples[j];
+                samples[j] = tmp;
+            }
+        }
+    }
+    long sum = 0;
+    for (int i = 10; i <= 20; i++) { sum += samples[i]; }
+    float adcMv = sum / 11.0f;
+    return ((adcMv / 1000.0f) * BAT_DIV_RATIO) + calibrationOffset;
+}
+
+// 3-Layer Battery SoC Stabilization Algorithm
+int processBatterySoC(float measuredVoltage, bool isNoLoad, bool forceNewCycle = false) {
+    // ชั้นที่ 1: ชดเชยแรงดันตกคร่อมหากวัดขณะ Relay ON (+0.08V)
+    float effectiveVoltage = isNoLoad ? measuredVoltage : (measuredVoltage + 0.08f);
+    float rawPct = calculateLiFePO4Percent(effectiveVoltage);
+
+    // Initial / Cold boot: ดึงค่าตามแรงดันจริงทันที
+    if (rtcLastStableBattPct < 0.0f || rtcLastStableBattPct > 100.0f) {
+        rtcLastStableBattPct = rawPct;
+        newCycleSoCAllowed = false;
+        return (int)(constrain(rtcLastStableBattPct, 0.0f, 100.0f) + 0.5f);
+    }
+
+    // ชั้นที่ 2: ตรวจจับแสงแดด (Solar Charging Phase: V >= 13.45V)
+    if (effectiveVoltage >= 13.45f) {
+        // แดดชาร์จจริง -> อนุญาตให้เปอร์เซ็นต์เพิ่มขึ้นได้
+        if (rawPct > rtcLastStableBattPct) {
+            rtcLastStableBattPct = (rtcLastStableBattPct * 0.70f) + (rawPct * 0.30f);
+        } else {
+            rtcLastStableBattPct = rawPct;
+        }
+        return (int)(constrain(rtcLastStableBattPct, 0.0f, 100.0f) + 0.5f);
+    }
+
+    // ชั้นที่ 3: กลางคืน / Discharging Phase (V < 13.45V)
+    // 3.1 Safety Bypass: หากแบตเตอรี่ต่ำวิกฤต (< 12.50V) ให้ลดลงตามจริงทันทีเพื่อความปลอดภัย
+    if (effectiveVoltage < 12.50f) {
+        rtcLastStableBattPct = min(rtcLastStableBattPct, rawPct);
+        return (int)(constrain(rtcLastStableBattPct, 0.0f, 100.0f) + 0.5f);
+    }
+
+    // 3.2 Monotonic Clamping: ห้าม % เด้งกลับขึ้นมาเด็ดขาดในตอนกลางคืน
+    if (rawPct > rtcLastStableBattPct) {
+        rawPct = rtcLastStableBattPct;
+    }
+
+    // 3.3 Dynamic Rate Limiter: จำกัดการลดลงสูงสุดไม่เกิน 2.0% ต่อรอบ (10 นาที)
+    // ใช้สิทธิ์การลดลงเฉพาะรอบใหม่เท่านั้น ไม่ลดลงซ้ำๆ ในระหว่างการโพลล์หน้าจอ
+    if (forceNewCycle || newCycleSoCAllowed) {
+        const float maxAllowedDrop = 2.0f;
+        if ((rtcLastStableBattPct - rawPct) > maxAllowedDrop) {
+            rtcLastStableBattPct -= maxAllowedDrop;
+        } else {
+            rtcLastStableBattPct = rawPct;
+        }
+        newCycleSoCAllowed = false;
+    }
+
+    return (int)(constrain(rtcLastStableBattPct, 0.0f, 100.0f) + 0.5f);
 }
 
 // ================= Background Sensor Task =================
@@ -749,7 +827,6 @@ void readSensorsQuick()
     static float   lastGX = 0.0f, lastGY = 0.0f;
     static float   lastTotalTilt = 0.0f, lastCorrectedLevel = 0.0f;
     static String  lastTiltStatus = "OK";
-    static float   smoothedVoltageLocal  = 0.0f;
     static float   tempLocal = NAN, humLocal = NAN;
 
     // 1. อ่าน GPS (พิกัด + NMEA RMC วันเวลา)
@@ -786,33 +863,9 @@ void readSensorsQuick()
         epochLocal = (now > 1700000000) ? (uint32_t)now : 0;
     }
 
-    // 2. แบตเตอรี่
-    int samples[31];
-    for (int i = 0; i < 31; i++) {
-        samples[i] = analogReadMilliVolts(CUSTOM_BAT_PIN);
-        delay(2);
-    }
-    for (int i = 0; i < 30; i++) {
-        for (int j = i + 1; j < 31; j++) {
-            if (samples[i] > samples[j]) {
-                int tmp = samples[i];
-                samples[i] = samples[j];
-                samples[j] = tmp;
-            }
-        }
-    }
-    long sum = 0;
-    for (int i = 10; i <= 20; i++) { sum += samples[i]; }
-    float adcMv             = sum / 11.0f;
-    float currentAvgVoltage = (adcMv / 1000.0f) * BAT_DIV_RATIO;
-
-    smoothedVoltageLocal = (smoothedVoltageLocal == 0.0f)
-                           ? currentAvgVoltage
-                           : (currentAvgVoltage * 0.10f) + (smoothedVoltageLocal * 0.90f);
-
-    float battVoltLocal = smoothedVoltageLocal + calibrationOffset;
-    float percent       = calculateLiFePO4Percent(battVoltLocal);
-    int   battPctLocal  = (int)(constrain(percent, 0.0f, 100.0f) + 0.5f);
+    // 2. แบตเตอรี่ (วัดขณะ Relay ON -> ชดเชย Load Sag และกรองด้วย 3-Layer Stabilization)
+    float battVoltLocal = readRawBatteryVoltage();
+    int   battPctLocal  = processBatterySoC(battVoltLocal, false, false);
 
     // 3. ESP32-C3
     float  levelLocal      = lastValidLevel;
@@ -899,6 +952,15 @@ void setup()
     VextON();
     delay(100);
 
+    analogReadResolution(12);
+
+    // วัด No-Load OCV แบตเตอรี่ก่อนเปิด Relay (ก่อนจ่ายไฟให้วงจรและเซนเซอร์)
+    float preRelayV   = readRawBatteryVoltage();
+    int   preRelayPct = processBatterySoC(preRelayV, true, true);
+    finalBatteryVoltage = preRelayV;
+    batPercentage       = preRelayPct;
+    Serial.printf("[BATT] Pre-relay No-load OCV: %.2fV | SoC: %d%%\n", preRelayV, preRelayPct);
+
     pinMode(RELAY_PIN,    OUTPUT);
     digitalWrite(RELAY_PIN, HIGH);  // เปิดจ่ายไฟให้วงจรและเซนเซอร์ตั้งแต่เริ่ม
 
@@ -938,8 +1000,6 @@ void setup()
         delay(50);
         Serial.println("SHT30 READY");
     }
-
-    analogReadResolution(12);
 
     pinMode(OLED_RESET, OUTPUT);
     digitalWrite(OLED_RESET, LOW);
@@ -1068,6 +1128,13 @@ void loop()
 
         case DEVICE_STATE_JOIN: {
             if (!joinTimerStarted) {
+                newCycleSoCAllowed = true;
+                // วัด No-Load OCV ก่อนเปิด Relay
+                float noLoadV = readRawBatteryVoltage();
+                int   noLoadPct = processBatterySoC(noLoadV, true, true);
+                finalBatteryVoltage = noLoadV;
+                batPercentage       = noLoadPct;
+
                 digitalWrite(RELAY_PIN, HIGH);    // เปิดไฟเลี้ยงวงจรเซนเซอร์รอบใหม่
                 digitalWrite(LED_RED_PIN, HIGH);  // เปิดไฟ LED สีแดง
                 isScreenOn = true;
