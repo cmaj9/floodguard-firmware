@@ -589,12 +589,18 @@ void loadBacklogFromFlash()
 void saveRemainingBacklogToFlash()
 {
     if (backlogCount == 0) {
-        LittleFS.remove(FLASH_BACKLOG_FILE);
+        if (LittleFS.exists(FLASH_BACKLOG_FILE)) {
+            LittleFS.remove(FLASH_BACKLOG_FILE);
+            Serial.println("[FLASH] Backlog ว่างแล้ว (0 packet) -> ลบไฟล์ Flash เรียบร้อย");
+        }
         return;
     }
 
     File f = LittleFS.open(FLASH_BACKLOG_FILE, "w");
-    if (!f) return;
+    if (!f) {
+        Serial.println("[FLASH] ERROR: เปิดไฟล์เขียนไม่ได้");
+        return;
+    }
 
     f.write((uint8_t *)&backlogCount, sizeof(backlogCount));
     for (uint16_t i = 0; i < backlogCount; i++) {
@@ -602,7 +608,7 @@ void saveRemainingBacklogToFlash()
         f.write(backlogQueue[idx].payload, PAYLOAD_TOTAL_SIZE);
     }
     f.close();
-    Serial.printf("[FLASH] บันทึกแพ็กเก็ตที่ยังส่งไม่หมด %d packet ค้างไว้ใน Flash ต่อไป\n", backlogCount);
+    Serial.printf("[FLASH] ตัดยอดสำเร็จ: บันทึกคงเหลือค้างใน Flash จริง %d packet\n", backlogCount);
 }
 
 // ================= CONFIRMED UPLINK =================
@@ -1153,7 +1159,8 @@ void loop()
 
                     if (acked) {
                         dequeueBacklog();
-                        Serial.printf("[BACKLOG] ส่งสำเร็จ 1 packet (คงเหลือในคิว %d packet)\n", backlogCount);
+                        saveRemainingBacklogToFlash(); // ตัดยอดออกจาก Flash ทันทีทุกแพ็กเก็ตที่ได้รับ ACK (Atomic Commit)
+                        Serial.printf("[BACKLOG] ส่งสำเร็จ 1 packet (คงเหลือค้าง %d packet)\n", backlogCount);
                         updateDisplay();
 
                         if (backlogCount > 0) {
