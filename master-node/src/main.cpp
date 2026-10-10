@@ -105,6 +105,7 @@ unsigned long joinSleepStartTime  = 0;
 unsigned long activeStartTime    = 0;
 unsigned long screenTimer        = 0;
 unsigned long lastDisplayUpdate  = 0;
+unsigned long relayPowerOnTime   = 0;  // จับเวลาตั้งแต่เปิดไฟ Relay 26 เลี้ยงเซนเซอร์
 bool          isActivePhase      = false;
 
 // โหมดตรวจเช็คเซนเซอร์ด้วยปุ่ม PRG (25 วินาที, ไม่ส่ง LoRaWAN)
@@ -185,10 +186,9 @@ const float BAT_R1        = 100000.0f;
 const float BAT_R2        =  20000.0f;
 const float BAT_DIV_RATIO = (BAT_R1 + BAT_R2) / BAT_R2;
 
-// RTC Memory: คงค่าไว้ข้าม Deep Sleep ไม่หายไปหลังหลับ 9.25 นาที และไม่ทำให้ Flash เสื่อม
+// RTC Memory: คงค่าไว้ข้าม Deep Sleep ไม่หายไปหลังหลับ และไม่ทำให้ Flash เสื่อม
 RTC_DATA_ATTR float    rtcLastStableBattPct     = -1.0f;
-RTC_DATA_ATTR uint32_t rtcTargetSleepDurationMs = 0;
-RTC_DATA_ATTR uint32_t rtcAccumulatedSleepMs     = 0;
+RTC_DATA_ATTR uint32_t rtcCycleTargetEpoch      = 0;      // เวลาเป้าหมายที่ต้องตื่นเริ่ม Active รอบถัดไป (Epoch หรือ relative sec)
 bool newCycleSoCAllowed = true;
 
 // คำนวณ % แบตเตอรี่ LiFePO4 4S ด้วย OCV Piecewise Curve (11.20V - 14.00V)
@@ -521,8 +521,15 @@ void parseNmeaRmc(const String &line, uint32_t &outEpoch)
 
             if (ep > 1700000000) {
                 outEpoch = ep;
+                time_t oldTime = time(nullptr);
+                int64_t timeShift = (int64_t)ep - (int64_t)oldTime;
                 struct timeval tv = { .tv_sec = (time_t)ep, .tv_usec = 0 };
                 settimeofday(&tv, NULL);
+                if (rtcCycleTargetEpoch > 0 && abs((long)timeShift) > 2) {
+                    rtcCycleTargetEpoch += timeShift;
+                    Serial.printf("[GPS TIME] ซิงค์เวลาดาวเทียมสำเร็จ: Epoch %lu -> ปรับเป้าหมายรอบถัดไปเป็น: %lu\n",
+                                  (unsigned long)ep, (unsigned long)rtcCycleTargetEpoch);
+                }
             }
         }
     }
@@ -725,7 +732,7 @@ void saveRemainingBacklogToFlash()
 }
 
 // ================= CONFIRMED UPLINK =================
-#define CONFIRMED_ACK_TIMEOUT_MS   10000
+#define CONFIRMED_ACK_TIMEOUT_MS   5000  // ประหยัดแบตเตอรี่: หน้าต่าง RX1/RX2 จบภายใน 2.5 วินาที รอสูงสุด 5 วินาทีเพียงพอ 100%
 #define BACKLOG_SEND_SPACING_MS    3000  // เว้นระยะห่างระหว่างแต่ละ packet 3 วินาที
 
 volatile bool waitingForAck     = false;
@@ -769,6 +776,10 @@ bool sendConfirmedAndWait(const uint8_t *payload, uint8_t size, uint32_t ackTime
     while (waitingForAck && (millis() - waitStart) < ackTimeoutMs) {
         LoRaWAN.sleep(loraWanClass);
         delay(10);
+    }
+
+    if (waitingForAck) {
+        Serial.println("[LORAWAN] หมดเวลารอ ACK (5 วินาที) -> ไม่ได้รับ ACK ในรอบนี้");
     }
 
     waitingForAck = false;
@@ -927,16 +938,17 @@ void readSensorsQuick()
     if (!isnan(h) && h >= 0.0f && h <= 100.0f)  humLocal  = h;
 
     Serial.println(F("---------------------------------------------"));
-    Serial.printf ("[CYCLE %lu ms]\n", millis());
+    Serial.printf ("[SENSOR %lu ms]\n", millis());
     Serial.printf ("  BATT   %.2fV  %d%%\n", battVoltLocal, battPctLocal);
     if (gpsValidLocal) {
-        Serial.printf("  GPS    OK   Lat:%.6f  Lng:%.6f  Sats:%lu\n", latLocal, lngLocal, (unsigned long)satsLocal);
+        Serial.printf("  GPS    OK   Lat: %.6f  Lng: %.6f  Sats: %lu\n", latLocal, lngLocal, (unsigned long)satsLocal);
     } else {
         Serial.println("  GPS    NO FIX");
     }
-    Serial.printf ("  TIME   Epoch:%lu\n", (unsigned long)epochLocal);
-    Serial.printf ("  LEVEL  Raw:%.1fcm  Corrected:%.1fcm\n", levelLocal, correctedLevel);
-    Serial.printf ("  GYRO   X:%.1f  Y:%.1f  Total:%.1f  Status:%s\n", gxLocal, gyLocal, totalTiltLocal, tiltLocal.c_str());
+    Serial.printf ("  TIME   Epoch: %lu\n", (unsigned long)epochLocal);
+    Serial.printf ("  SHT30  T: %.1fC  H: %.1f%%\n", tempLocal, humLocal);
+    Serial.printf ("  LEVEL  Raw: %.1fcm  Corrected: %.1fcm\n", levelLocal, correctedLevel);
+    Serial.printf ("  GYRO   X: %.1f  Y: %.1f  Total: %.1f  Status: %s\n", gxLocal, gyLocal, totalTiltLocal, tiltLocal.c_str());
     Serial.println(F("---------------------------------------------"));
 
     // 5. Commit ข้อมูลเข้า Global ภายใต้ Mutex
@@ -974,17 +986,16 @@ void sensorTask(void *pvParameters)
 // โหมดตรวจเช็คเซนเซอร์ 25 วินาทีเมื่อตื่นจาก Deep Sleep ด้วยปุ่ม PRG (GPIO 0)
 // ห้ามส่ง LoRaWAN, ไม่แตะต้อง Flash Backlog, ไม่เปิดสัญญาณวิทยุ, ปิด LED ทั้งหมด
 // ==============================================================================
-void runPrgInspectionMode(uint32_t actualSleepMs)
+void runPrgInspectionMode()
 {
     Serial.println(F("\n================================================================="));
     Serial.println(F("=== [PRG WAKE] ตื่นจาก Deep Sleep เข้าสู่โหมดตรวจเช็ค (25s) ==="));
     Serial.println(F("=== [PRG WAKE] ห้ามส่ง LoRaWAN / ไม่แตะ Flash / ปิด LED ทุกดวง  ==="));
     Serial.println(F("================================================================="));
 
-    // สะสมเวลานอนจริงที่วัดได้จาก Hardware Register ของ ESP32-S3
-    rtcAccumulatedSleepMs += actualSleepMs;
-    Serial.printf("[PRG] เวลานอนจริงรอบนี้: %lu ms | รวมเวลานอนสะสม: %lu ms | เป้าหมายรอบ: %lu ms\n",
-                  actualSleepMs, rtcAccumulatedSleepMs, rtcTargetSleepDurationMs);
+    time_t wakeEpoch = time(nullptr);
+    Serial.printf("[PRG] เวลาตื่นปัจจุบัน Epoch:%lu | เป้าหมายรอบถัดไป Epoch:%lu\n",
+                  (unsigned long)wakeEpoch, (unsigned long)rtcCycleTargetEpoch);
 
     VextON();
     delay(100);
@@ -1078,8 +1089,6 @@ void runPrgInspectionMode(uint32_t actualSleepMs)
 
     // 8. ครบเวลาตรวจเช็ค 25 วินาที
     Serial.println(F("=== [PRG WAKE] จบการตรวจเช็ค 25 วินาที ==="));
-    uint32_t inspectionDuration = millis() - inspectionStartTime;
-    rtcAccumulatedSleepMs += inspectionDuration;
 
     isInspectionMode = false;
     isScreenOn       = false;
@@ -1091,24 +1100,33 @@ void runPrgInspectionMode(uint32_t actualSleepMs)
     oled.ssd1306_command(SSD1306_DISPLAYOFF);
     digitalWrite(RELAY_PIN, LOW); // ตัดไฟเซนเซอร์ทันที
 
-    // 9. คำนวณเวลานอนที่เหลือของรอบส่ง 10 นาที
-    int64_t remainingSleepMs = (int64_t)rtcTargetSleepDurationMs - (int64_t)rtcAccumulatedSleepMs;
+    // 9. คำนวณเวลานอนที่เหลือตามเป้าหมาย rtcCycleTargetEpoch
+    time_t nowEpoch = time(nullptr);
+    int64_t remainingSleepSec = 0;
 
-    Serial.printf("[PRG] สรุปเวลา: รอบนอนตั้งไว้ %lu ms | หลับ+ตรวจเช็คสะสม %lu ms | คงเหลือ %lld ms\n",
-                  rtcTargetSleepDurationMs, rtcAccumulatedSleepMs, remainingSleepMs);
+    if (rtcCycleTargetEpoch > 0) {
+        remainingSleepSec = (int64_t)rtcCycleTargetEpoch - (int64_t)nowEpoch;
+    } else {
+        remainingSleepSec = 555;
+    }
 
-    if (remainingSleepMs > 50) {
-        // เหลือเวลา -> กลับเข้าสู่ Deep Sleep ต่อจนครบเวลาที่เหลือจริงตามที่ผู้ใช้กำหนด (Q2)
-        Serial.printf("[PRG] กลับเข้าสู่ Deep Sleep ต่ออีก %lld ms (%.2f นาที)...\n",
-                      remainingSleepMs, (float)remainingSleepMs / 60000.0f);
-        esp_sleep_enable_timer_wakeup((uint64_t)remainingSleepMs * 1000ULL);
+    Serial.printf("[PRG] สรุปเวลา: ปัจจุบัน Epoch:%lu | เป้าหมาย Epoch:%lu | คงเหลือ %lld วินาที (%.2f นาที)\n",
+                  (unsigned long)nowEpoch, (unsigned long)rtcCycleTargetEpoch,
+                  remainingSleepSec, (float)remainingSleepSec / 60.0f);
+
+    if (remainingSleepSec > 2) {
+        // เหลือเวลา -> กลับเข้าสู่ Deep Sleep ต่อจนครบเวลาเป้าหมายจริง (Drift = 0s)
+        Serial.printf("[PRG] กลับเข้าสู่ Deep Sleep ต่ออีก %lld วินาที (%.2f นาที)...\n",
+                      remainingSleepSec, (float)remainingSleepSec / 60.0f);
+        Radio.Sleep();
+        esp_sleep_enable_timer_wakeup((uint64_t)remainingSleepSec * 1000000ULL);
         esp_sleep_enable_ext0_wakeup((gpio_num_t)BUTTON_PIN, 0);
         Mcu.addwakeio((uint8_t)BUTTON_PIN);
         VextOFF();
         esp_deep_sleep_start();
     } else {
-        // เวลาหมดพอดีหรือเกินรอบส่งแล้ว -> ออกจากฟังก์ชัน ให้ setup() ทำงานต่อเพื่อส่ง LoRaWAN ปกติ
-        Serial.println(F("[PRG] ครบเวลานอนของรอบส่ง LoRaWAN แล้ว -> เปลี่ยนผ่านเข้าสู่การส่งข้อมูล"));
+        // เวลาหมดพอดีหรือเกินรอบส่งแล้ว (Q2: A) -> ออกจากฟังก์ชัน ให้ setup() ทำงานต่อเพื่อส่ง LoRaWAN ปกติ
+        Serial.println(F("[PRG] ถึงเวลาเริ่มรอบส่ง LoRaWAN แล้ว -> เปลี่ยนผ่านเข้าสู่การส่งข้อมูลทันที"));
         return;
     }
 }
@@ -1120,11 +1138,11 @@ void setup()
     // ตรวจจับการตื่นจาก Deep Sleep ด้วยปุ่ม PRG ทันทีที่บรรทัดแรก
     esp_sleep_wakeup_cause_t wakeupReason = esp_sleep_get_wakeup_cause();
     if (wakeupReason == ESP_SLEEP_WAKEUP_EXT0 || wakeupReason == ESP_SLEEP_WAKEUP_GPIO) {
-        // วัดเวลานอนจริงจาก Hardware Register ของ ESP32-S3 RTC โดยตรง ไม่ผ่านตัวแปรซอฟต์แวร์
-        uint64_t sleepCycles   = rtc_deep_slp_time_get();
-        uint32_t calPeriod     = esp_clk_slowclk_cal_get();
-        uint32_t actualSleepMs = (uint32_t)(rtc_time_slowclk_to_us(sleepCycles, calPeriod) / 1000ULL);
-        runPrgInspectionMode(actualSleepMs);
+        runPrgInspectionMode();
+    } else if (wakeupReason != ESP_SLEEP_WAKEUP_TIMER) {
+        // เป็นการเปิดเครื่องใหม่ หรือกดปุ่ม Reset ฮาร์ดแวร์ (Cold boot / HW Reset)
+        rtcCycleTargetEpoch = 0;
+        Serial.println(F("[SYSTEM] ฮาร์ดแวร์ Reset หรือเปิดเครื่องใหม่ -> รีเซ็ตจับเวลาเริ่ม Cycle ใหม่"));
     }
 
     if (!LittleFS.begin(true)) {
@@ -1151,6 +1169,7 @@ void setup()
 
     pinMode(RELAY_PIN,    OUTPUT);
     digitalWrite(RELAY_PIN, HIGH);  // เปิดจ่ายไฟให้วงจรและเซนเซอร์ตั้งแต่เริ่ม
+    relayPowerOnTime = millis();
 
     pinMode(LED_RED_PIN,  OUTPUT);
     pinMode(LED_GREEN_PIN, OUTPUT);
@@ -1363,11 +1382,13 @@ void loop()
             newCycleSoCAllowed = true;
             digitalWrite(RELAY_PIN, HIGH);
 
-            // หน่วงเวลา 4 วินาทีหลัง Join สำเร็จ เพื่อให้ Gateway & Network Server พร้อมรับ Uplink
-            Serial.println("[SEND] เตรียมอ่านเซนเซอร์และตรวจสอบความพร้อม...");
-            delay(2000);
+            // รอให้วงจรเซนเซอร์, ESP32-C3, GPS, SHT30 อุ่นเครื่องจนค่าเสถียรแน่นอน (การันตีจ่ายไฟอย่างน้อย 5 วินาที)
+            Serial.println("[SEND] ตรวจสอบความพร้อมเซนเซอร์ (การันตีเปิดไฟอุ่นเครื่องอย่างน้อย 5 วินาที)...");
+            while (millis() - relayPowerOnTime < 5000UL) {
+                delay(100);
+            }
 
-            // 1. อ่านค่าเซนเซอร์รอบปัจจุบันก่อนเสมอ (รับประกันว่าข้อมูลรอบนี้ถูกอ่านและแปลงเป็นแพ็กเก็ตแน่นอน ไม่สูญหาย)
+            // 1. อ่านค่าเซนเซอร์รอบปัจจุบันก่อนเสมอ (รับประกันว่า sensorTask มีข้อมูลพร้อมใช้งาน 100%)
             if (!sensorDataReady) {
                 unsigned long waitStart = millis();
                 while (!sensorDataReady && millis() - waitStart < SENSOR_FIRST_READ_TIMEOUT_MS) {
@@ -1390,6 +1411,25 @@ void loop()
             sensorDataReady  = false;
             sensorTaskActive = true;
 
+            // กำหนดเป้าหมายเวลาของรอบถัดไป (นับ 10 นาทีเต็มจากจุดเริ่ม Active นี้)
+            time_t nowEpoch = time(nullptr);
+            uint32_t intervalSec = TOTAL_CYCLE_MS / 1000UL;
+            if (rtcCycleTargetEpoch == 0) {
+                rtcCycleTargetEpoch = (uint32_t)nowEpoch + intervalSec;
+                Serial.printf("[CYCLE] เริ่มต้น Cycle แรก (T0 Epoch:%lu) -> กำหนดรอบถัดไปที่ Epoch:%lu (อีก %lu วินาที / %.2f นาที)\n",
+                              (unsigned long)nowEpoch, (unsigned long)rtcCycleTargetEpoch,
+                              (unsigned long)intervalSec, (float)intervalSec / 60.0f);
+            } else {
+                if (rtcCycleTargetEpoch + intervalSec < (uint32_t)nowEpoch) {
+                    rtcCycleTargetEpoch = (uint32_t)nowEpoch + intervalSec;
+                } else {
+                    rtcCycleTargetEpoch += intervalSec;
+                }
+                Serial.printf("[CYCLE] เริ่มต้น Cycle รอบใหม่ (Epoch:%lu) -> กำหนดรอบถัดไปที่ Epoch:%lu (อีก %lu วินาที / %.2f นาที)\n",
+                              (unsigned long)nowEpoch, (unsigned long)rtcCycleTargetEpoch,
+                              (unsigned long)intervalSec, (float)intervalSec / 60.0f);
+            }
+
             currentStatus = "Sending...";
             isScreenOn    = true;
             screenTimer   = millis();
@@ -1411,7 +1451,7 @@ void loop()
                 while (backlogCount > 0) {
                     bool acked = false;
 
-                    // ลองส่งแพ็กเก็ตเดิมได้สูงสุด 2 ครั้ง หากไม่ได้ ACK
+                    // ลองส่งแพ็กเก็ตเดิมได้สูงสุด 2 ครั้ง หากไม่ได้ ACK (ประหยัดพลังงาน)
                     for (int retry = 0; retry < 2; retry++) {
                         saveNextFCntBeforeSend();
                         acked = sendConfirmedAndWait(backlogQueue[backlogHead].payload, PAYLOAD_TOTAL_SIZE, CONFIRMED_ACK_TIMEOUT_MS);
@@ -1419,8 +1459,12 @@ void loop()
                         if (acked) {
                             break; // ได้รับ ACK แล้ว ออกจากลูป retry
                         } else {
-                            Serial.printf("[BACKLOG] ครั้งที่ %d ไม่ได้รับ ACK -> รอ 3 วิแล้วลองใหม่...\n", retry + 1);
-                            delay(3000);
+                            if (retry < 1) {
+                                Serial.printf("[BACKLOG] รอบที่ %d ไม่ได้รับ ACK -> รอ 3 วิแล้วลองใหม่รอบที่ %d...\n", retry + 1, retry + 2);
+                                delay(3000);
+                            } else {
+                                Serial.printf("[BACKLOG] รอบที่ %d ไม่ได้รับ ACK (ครบ 2 ครั้งแล้ว)\n", retry + 1);
+                            }
                         }
                     }
 
@@ -1453,10 +1497,6 @@ void loop()
                     Serial.println("[FLASH] ส่งข้อมูลครบทั้งหมดแล้ว -> ลบไฟล์ Flash สำเร็จ");
                 }
                 Serial.println("[SEND] ส่งข้อมูลสำเร็จครบถ้วนทุกรายการ (คิวว่าง 0 packet)!");
-
-                // รีเซ็ต activeStartTime ใหม่ เพื่อให้นับถอยหลัง 45 วินาทีเต็ม แสดงผลข้อมูลบนหน้าจอ OLED
-                activeStartTime = millis();
-                isActivePhase   = true;
             }
 
             delay(1000);
@@ -1467,14 +1507,19 @@ void loop()
         case DEVICE_STATE_CYCLE: {
             digitalWrite(LED_GREEN_PIN, LOW);
 
-            unsigned long elapsed   = millis() - activeStartTime;
-            long          remaining = (long)appTxDutyCycle - (long)elapsed;
-            if (remaining < 10000L) remaining = 10000L;
-
-            long rndMs = remaining + (long)randr(-APP_TX_DUTYCYCLE_RND, APP_TX_DUTYCYCLE_RND);
-            if (rndMs < 10000L) rndMs = 10000L;
-            currentTxWait   = (uint32_t)rndMs;
+            time_t nowEpoch = time(nullptr);
+            int64_t remainingSec = 0;
+            if (rtcCycleTargetEpoch > 0) {
+                remainingSec = (int64_t)rtcCycleTargetEpoch - (int64_t)nowEpoch;
+            } else {
+                remainingSec = TOTAL_CYCLE_MS / 1000UL;
+            }
+            if (remainingSec < 10) remainingSec = 10;
+            currentTxWait   = (uint32_t)(remainingSec * 1000UL);
             txDutyCycleTime = currentTxWait;
+
+            Serial.printf("[CYCLE] ปัจจุบัน Epoch:%lu | เป้าหมายเริ่มรอบถัดไป Epoch:%lu | เวลาคงเหลือในรอบ %lld วินาที (%.2f นาที)\n",
+                          (unsigned long)nowEpoch, (unsigned long)rtcCycleTargetEpoch, remainingSec, (float)remainingSec / 60.0f);
 
             isScreenOn      = true;
             screenTimer     = millis();
@@ -1490,7 +1535,7 @@ void loop()
 
         case DEVICE_STATE_SLEEP: {
 
-            // ดักจับการกดปุ่ม PRG (GPIO 0) ผ่าน Flag One-shot จาก ISR พร้อม Debounce
+            // ดักจับการกดปุ่ม PRG (GPIO 0) ผ่าน Flag One-shot จาก ISR พร้อม Debounce (Q3: A ปลุกจอได้ตลอดเวลา)
             if (prgButtonPressed) {
                 prgButtonPressed = false;
 
@@ -1498,17 +1543,17 @@ void loop()
                     // หากกดซ้ำขณะตรวจเช็คอยู่ -> รีเซ็ตเวลากลับเป็น 25 วินาทีใหม่เพื่อยืดเวลาดูต่อ
                     inspectionStartTime = millis();
                     Serial.println(F("[PRG] กดปุ่มซ้ำ -> รีเซ็ตเวลาตรวจเช็คให้นับ 25 วินาทีใหม่"));
-                } else if (!isActivePhase) {
-                    Serial.println(F("=== กดปุ่ม PRG -> ตื่นตรวจเช็คเซนเซอร์ (Inspection Mode 25s, ไม่ส่งค่า) ==="));
+                } else {
+                    Serial.println(F("=== กดปุ่ม PRG -> ปลุกหน้าจอ OLED ตรวจเช็คเซนเซอร์ (25s) ==="));
 
-                    // 1. อ่านค่าแรงดัน No-Load OCV ก่อนเปิด Relay 26
+                    // 1. อ่านค่าแรงดัน No-Load OCV
                     float noLoadV = readRawBatteryVoltage();
                     int   noLoadPct = processBatterySoC(noLoadV, true, true);
                     finalBatteryVoltage = noLoadV;
                     batPercentage       = noLoadPct;
                     Serial.printf("[BATT] PRG Inspection No-load: %.2fV | SoC: %d%%\n", noLoadV, noLoadPct);
 
-                    // 2. ปิดไฟ LED ทั้งหมดเพื่อประหยัดพลังงานแบตเตอรี่สูงสุด
+                    // 2. ปิดไฟ LED ทั้งหมดเพื่อประหยัดพลังงาน
                     digitalWrite(LED_RED_PIN, LOW);
                     digitalWrite(LED_GREEN_PIN, LOW);
 
@@ -1535,20 +1580,29 @@ void loop()
                 if (insElapsed >= INSPECTION_DURATION_MS) {
                     // ครบ 25 วินาที: สิ้นสุดโหมดตรวจเช็ค
                     isInspectionMode = false;
-                    isScreenOn       = false;
-                    oled.ssd1306_command(SSD1306_DISPLAYOFF);
                     Serial.println(F("=== สิ้นสุดโหมดตรวจเช็ค 25 วินาที ==="));
 
-                    if (pendingTransmission) {
-                        pendingTransmission = false;
-                        Serial.println(F("[INSPECTION] ถึงรอบส่ง LoRaWAN ปกติพอดี -> เริ่มการส่งข้อมูลทันที"));
+                    time_t nowEpoch = time(nullptr);
+                    if (rtcCycleTargetEpoch > 0 && (uint32_t)nowEpoch >= rtcCycleTargetEpoch) {
+                        // ถึงรอบส่ง LoRaWAN พอดีหรือเกินรอบส่งแล้ว (Q2: A) -> เริ่มส่งข้อมูลทันที
+                        Serial.println(F("[INSPECTION] ถึง/เกินเป้าหมายรอบส่งแล้ว -> เริ่มการส่งข้อมูลรอบถัดไปทันที"));
+                        isScreenOn = false;
+                        oled.ssd1306_command(SSD1306_DISPLAYOFF);
                         deviceState = DEVICE_STATE_SEND;
                         break;
+                    }
+
+                    if (isActivePhase) {
+                        // ยังอยู่ในช่วง Active Phase (45s แรก) ปล่อยให้ Active Phase จัดการต่อ
+                        Serial.println(F("[INSPECTION] ยังอยู่ในช่วง Active Phase -> กลับสู่การทำงาน Active ปกติ"));
                     } else {
+                        // พ้น Active Phase แล้ว -> ดับจอ ตัดไฟเซนเซอร์ แล้วกลับเข้าสู่ Deep Sleep ต่อเนื่อง
+                        isScreenOn = false;
+                        oled.ssd1306_command(SSD1306_DISPLAYOFF);
                         digitalWrite(RELAY_PIN, LOW);     // ตัดไฟวงจรเซนเซอร์
                         sensorTaskActive = false;
                         currentStatus    = "Sleep";
-                        Serial.println(F("[INSPECTION] ตัดไฟ Relay 26 ดับจอ -> กลับเข้าสู่ Sleep ต่อเนื่อง"));
+                        Serial.println(F("[INSPECTION] ตัดไฟ Relay 26 ดับจอ -> เตรียมเข้าสู่ Deep Sleep ต่อเนื่อง"));
                     }
                 } else {
                     if (isScreenOn && millis() - lastDisplayUpdate > 1000) {
@@ -1567,8 +1621,7 @@ void loop()
             // ใน Active Phase (45 วินาที): ให้หน้าจอและเซนเซอร์ทำงานต่อเนื่อง ห้ามเข้า Deep Sleep
             if (isActivePhase) {
                 // ดับหน้าจอ OLED เมื่อถึงเวลา SCREEN_ON_DURATION_MS (25 วินาที) เพื่อประหยัดแบตเตอรี่
-                // แต่วงจรเซนเซอร์, Relay และการส่งข้อมูล LoRaWAN ยังคงทำงานต่อไปจนครบ 45 วินาที (1 Cycle) ตามปกติ
-                if (isScreenOn && (millis() - activeStartTime >= SCREEN_ON_DURATION_MS)) {
+                if (isScreenOn && !isInspectionMode && (millis() - activeStartTime >= SCREEN_ON_DURATION_MS)) {
                     isScreenOn = false;
                     oled.ssd1306_command(SSD1306_DISPLAYOFF);
                     Serial.println("=== ดับหน้าจอ OLED (ครบ 25 วินาที) เพื่อประหยัดพลังงาน | วงจรเซนเซอร์ยังทำงานใน 1 Cycle ===");
@@ -1584,9 +1637,8 @@ void loop()
                     digitalWrite(RELAY_PIN, LOW);     // ตัดไฟวงจรภายนอกและเซนเซอร์
                     digitalWrite(LED_RED_PIN, LOW);   // ดับไฟ LED สีแดง
                     digitalWrite(LED_GREEN_PIN, LOW); // ดับไฟ LED สีเขียว
-                    Serial.printf("=== สิ้นสุด Active Phase (%lu s) -> ดับจอ, ตัดไฟวงจรเซนเซอร์, ดับ LED -> เริ่ม Sleep (%.2f นาที) ===\n",
-                                  (unsigned long)(ACTIVE_DURATION / 1000UL),
-                                  (float)(appTxDutyCycle - ACTIVE_DURATION) / 60000.0f);
+                    Serial.printf("=== สิ้นสุด Active Phase (%lu s) -> ดับจอ, ตัดไฟวงจรเซนเซอร์, ดับ LED ===\n",
+                                  (unsigned long)(ACTIVE_DURATION / 1000UL));
                 } else {
                     if (isScreenOn && millis() - lastDisplayUpdate > 1000) {
                         lastDisplayUpdate = millis();
@@ -1596,20 +1648,29 @@ void loop()
                 break;
             }
 
-            // พ้น 45 วินาทีแล้ว จึงเข้าสู่ Deep Sleep สำหรับเวลาที่เหลือ (~9.25 นาที)
-            // เปิดใช้งาน hardware wake-up ผ่านปุ่ม PRG (GPIO 0)
+            // พ้น 45 วินาทีแล้ว จึงเข้าสู่ Deep Sleep สำหรับเวลาที่เหลือจนถึง rtcCycleTargetEpoch
             esp_sleep_enable_ext0_wakeup((gpio_num_t)BUTTON_PIN, 0);
             Mcu.addwakeio((uint8_t)BUTTON_PIN);
 
-            // บันทึกเวลาเป้าหมายและรีเซ็ตเวลานอนสะสมสำหรับรอบส่งใหม่
-            rtcTargetSleepDurationMs = (appTxDutyCycle > ACTIVE_DURATION) ? (appTxDutyCycle - ACTIVE_DURATION) : 10000;
-            rtcAccumulatedSleepMs    = 0;
+            time_t nowEpoch = time(nullptr);
+            int64_t remainingSleepSec = 0;
+            if (rtcCycleTargetEpoch > 0) {
+                remainingSleepSec = (int64_t)rtcCycleTargetEpoch - (int64_t)nowEpoch;
+            } else {
+                remainingSleepSec = (appTxDutyCycle > ACTIVE_DURATION) ? (appTxDutyCycle - ACTIVE_DURATION) / 1000L : 555;
+            }
 
-            LoRaWAN.sleep(loraWanClass);
-
-            if (isScreenOn && millis() - screenTimer > SCREEN_TIMEOUT) {
-                oled.ssd1306_command(SSD1306_DISPLAYOFF);
-                isScreenOn = false;
+            if (remainingSleepSec > 2) {
+                Serial.printf("=== เริ่ม Deep Sleep %lld วินาที (%.2f นาที) จนถึงเป้าหมายรอบถัดไป Epoch:%lu (Drift = 0s) ===\n",
+                              remainingSleepSec, (float)remainingSleepSec / 60.0f, (unsigned long)rtcCycleTargetEpoch);
+                Radio.Sleep();
+                esp_sleep_enable_timer_wakeup((uint64_t)remainingSleepSec * 1000000ULL);
+                VextOFF();
+                esp_deep_sleep_start();
+            } else {
+                // ถึงรอบส่งถัดไปพอดี
+                Serial.println(F("[SLEEP] ถึงเวลาส่งรอบถัดไปแล้ว -> เริ่มส่งข้อมูลทันที"));
+                deviceState = DEVICE_STATE_SEND;
             }
 
             break;
