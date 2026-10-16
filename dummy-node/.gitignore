@@ -1,0 +1,14 @@
+# PlatformIO build artifacts & dependencies
+.pio/
+
+# VS Code environment & workspace files
+.vscode/
+
+# Sensitive credentials & secrets (ห้าม commit keys ออกสู่ GitHub)
+include/credentials.h
+credentials.h
+*secrets.h
+
+# OS generated files
+Thumbs.db
+.DS_Store
