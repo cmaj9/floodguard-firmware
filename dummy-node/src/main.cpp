@@ -35,9 +35,7 @@
 #define MANUAL_TX_COOLDOWN_MS     60000UL     // << Cooldown ปุ่ม PRG (1 นาที = 60000 ms)
 #define CONFIRMED_ACK_TIMEOUT_MS  5000UL      // เวลารอ ACK จาก Gateway สูงสุด (5 วินาที)
 
-// Base Unix Epoch เริ่มต้น (2026-10-17 08:40:00 UTC = 1792226400UL หรือ 15:40:00 เวลาไทย)
-// และมีระบบซิงค์เวลาอัตโนมัติจาก Gateway ผ่าน LoRaWAN DeviceTimeReq
-#define BASE_EPOCH                1792226400UL
+// ระบบซิงค์เวลาจริงอัตโนมัติจาก LoRaWAN Gateway ผ่านคำสั่ง MAC DeviceTimeReq (ไม่ใช้ Mockup)
 
 // ==============================================================================
 // 2. ช่วงค่าจำลองเซนเซอร์ (DUMMY SENSOR RANGES) - ปรับเปลี่ยนได้ที่นี่
@@ -57,9 +55,12 @@ const float MOCK_GYRO_MAX     = 15.0f;     // มุมเอียง Gyro X, Y
 const float MOCK_BAT_V_MIN    = 12.50f;    // แรงดันแบตเตอรี่ต่ำสุด (V)
 const float MOCK_BAT_V_MAX    = 13.60f;    // แรงดันแบตเตอรี่สูงสุด (V)
 
-const float MOCK_LAT_CENTER   = 13.7563f;  // พิกัด GPS Latitude เริ่มต้น
-const float MOCK_LNG_CENTER   = 100.5018f; // พิกัด GPS Longitude เริ่มต้น
-const float MOCK_GPS_JITTER   = 0.0010f;   // ระยะแกว่งพิกัด GPS (+/- 0.001 องศา)
+// 1. กำหนดพิกัดศูนย์กลางให้ตรงกับจุดอ้างอิงของสถานี ST-004
+const float MOCK_LAT_CENTER   = 14.035269f;  // << ใส่ Latitude จุดอ้างอิงของสถานีจริง
+const float MOCK_LNG_CENTER   = 100.729226f; // << ใส่ Longitude จุดอ้างอิงของสถานีจริง
+
+// 2. ปรับระยะแกว่งไม่เกิน 40 เมตร (แนะนำ 0.00025f หรือ 0.00020f)
+const float MOCK_GPS_JITTER   = 0.00025f;  // << แกว่งแกนละประมาณ +/- 27 เมตร (ระยะรวมไม่เกิน 40 เมตรแน่นอน)
 
 // ================= LoRaWAN Config (OTAA) =================
 #if __has_include("credentials.h")
@@ -465,6 +466,75 @@ extern "C" void dev_time_updated() {
     }
 }
 
+extern "C" void downLinkDataHandle(McpsIndication_t *mcpsIndication) {
+    Serial.printf("[LORAWAN] Downlink Data: Port %d, RSSI %d, SNR %d\n",
+                  mcpsIndication->Port, mcpsIndication->Rssi, mcpsIndication->Snr);
+    TimerSysTime_t sysTimeCurrent = TimerGetSysTime();
+    if (sysTimeCurrent.Seconds > 1700000000) {
+        struct timeval tv = { .tv_sec = (time_t)sysTimeCurrent.Seconds, .tv_usec = 0 };
+        settimeofday(&tv, NULL);
+        isTimeSynced = true;
+        Serial.printf("[TIME SYNC] อัปเดตเวลาจริงจาก LoRaWAN สำเร็จ! Epoch: %lu\n", (unsigned long)sysTimeCurrent.Seconds);
+    }
+}
+
+// ฟังก์ชันส่ง Probe ขอเวลาจริงจาก Gateway ทันทีที่ Join สำเร็จก่อนเริ่มส่งแพ็กเก็ตแรก
+void syncTimeFromGateway() {
+    if (isTimeSynced) return;
+
+    Serial.println(F("[TIME] โหนดเพิ่งบูต -> เริ่มขอเวลาจริงจาก LoRaWAN Gateway (DeviceTimeReq)..."));
+    currentStatus = "SYNC";
+    updateDisplay();
+
+    LoRaWAN.setDefaultDR(DR_2);
+    defaultDrForNoAdr = DR_2;
+    currentDrForNoAdr = DR_2;
+
+    MibRequestConfirm_t mibReq;
+    mibReq.Type = MIB_CHANNELS_DATARATE;
+    mibReq.Param.ChannelsDatarate = DR_2;
+    LoRaMacMibSetRequestConfirm(&mibReq);
+
+    mibReq.Type = MIB_CHANNELS_DEFAULT_DATARATE;
+    mibReq.Param.ChannelsDefaultDatarate = DR_2;
+    LoRaMacMibSetRequestConfirm(&mibReq);
+
+    MlmeReq_t mlmeTimeReq;
+    mlmeTimeReq.Type = MLME_DEVICE_TIME;
+    LoRaMacMlmeRequest(&mlmeTimeReq);
+
+    uint8_t dummyByte = 0x00;
+    memcpy(appData, &dummyByte, 1);
+    appDataSize = 1;
+    appPort = 2;
+    isTxConfirmed = false;
+    LoRaWAN.send();
+    isTxConfirmed = true;
+
+    Serial.println(F("[TIME] ส่ง Time Sync Probe ออกไปแล้ว รอรับ DeviceTimeAns จาก Gateway (1-4 วินาที)..."));
+
+    unsigned long startWait = millis();
+    while (!isTimeSynced && (millis() - startWait < 5000)) {
+        Mcu.timerhandler();
+        Radio.IrqProcess();
+
+        TimerSysTime_t sysTime = TimerGetSysTime();
+        if (sysTime.Seconds > 1700000000) {
+            struct timeval tv = { .tv_sec = (time_t)sysTime.Seconds, .tv_usec = 0 };
+            settimeofday(&tv, NULL);
+            isTimeSynced = true;
+            break;
+        }
+        delay(10);
+    }
+
+    if (isTimeSynced) {
+        Serial.printf("[TIME] *** ซิงค์เวลาจริงสำเร็จ! Real Epoch: %lu ***\n", (unsigned long)time(nullptr));
+    } else {
+        Serial.println(F("[TIME] !!! Gateway ยังไม่ตอบรับเวลาจริง (จะขอเวลาซ้ำในแพ็กเก็ตถัดไป) !!!"));
+    }
+}
+
 bool sendConfirmedAndWait(const uint8_t *payload, uint8_t size, uint32_t ackTimeoutMs) {
     memcpy(appData, payload, size);
     appDataSize = size;
@@ -506,6 +576,17 @@ bool sendConfirmedAndWait(const uint8_t *payload, uint8_t size, uint32_t ackTime
         Mcu.timerhandler();
         Radio.IrqProcess();
 
+        // ตรวจสอบเวลาคู่ขนานขณะรอ ACK
+        if (!isTimeSynced) {
+            TimerSysTime_t sysTime = TimerGetSysTime();
+            if (sysTime.Seconds > 1700000000) {
+                struct timeval tv = { .tv_sec = (time_t)sysTime.Seconds, .tv_usec = 0 };
+                settimeofday(&tv, NULL);
+                isTimeSynced = true;
+                Serial.printf("[TIME SYNC] ซิงค์เวลาจริงระหว่างรอ ACK สำเร็จ! Epoch: %lu\n", (unsigned long)sysTime.Seconds);
+            }
+        }
+
         // อัปเดตแอนิเมชันคลื่นวิทยุขณะรอ ACK ทุก 180 ms
         if (millis() - lastAnimTime >= 180) {
             lastAnimTime = millis();
@@ -536,10 +617,7 @@ void setup() {
     // สุ่มค่าเริ่มต้นจากฮาร์ดแวร์ ESP32
     randomSeed(esp_random());
 
-    // ตั้งค่าเวลาเริ่มต้น Base Unix Epoch ให้ระบบนาฬิกาภายใน
-    struct timeval tv = { .tv_sec = (time_t)BASE_EPOCH, .tv_usec = 0 };
-    settimeofday(&tv, NULL);
-    Serial.printf("[TIME] Base Epoch initialized: %lu\n", (unsigned long)BASE_EPOCH);
+    Serial.println(F("[TIME] โหมดเวลาจริง: รอดึงเวลาจาก LoRaWAN Gateway (DeviceTimeReq) - ไม่ใช้ Mockup"));
 
     // สร้างค่าจำลองรอบแรกทันทีเพื่อพร้อมแสดงผลบนจอ
     generateDummyValues();
@@ -658,10 +736,15 @@ void loop() {
             isJoinedNetwork = true;
             digitalWrite(LED_RED_PIN, LOW); // ดับไฟแดงเมื่อ Join สำเร็จ
 
-            // 1. สุ่มค่าข้อมูลจำลองรอบใหม่
+            // 1. หากเพิ่งบูตเครื่องและยังไม่ได้ซิงค์เวลาจริง ให้ขอเวลาก่อนส่งแพ็กเก็ตแรก
+            if (!isTimeSynced) {
+                syncTimeFromGateway();
+            }
+
+            // 2. สุ่มค่าข้อมูลจำลองรอบใหม่ ณ เวลาที่จะส่งจริง
             generateDummyValues();
 
-            // 2. จัดรูปแบบ 26-Byte Payload
+            // 3. จัดรูปแบบ 26-Byte Payload โดยใช้เวลาจริง ณ วินาทีนี้ (time(nullptr))
             uint8_t payload[PAYLOAD_TOTAL_SIZE];
             buildSensorPayload(payload);
 
