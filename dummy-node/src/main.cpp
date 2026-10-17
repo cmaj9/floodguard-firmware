@@ -35,9 +35,9 @@
 #define MANUAL_TX_COOLDOWN_MS     60000UL     // << Cooldown ปุ่ม PRG (1 นาที = 60000 ms)
 #define CONFIRMED_ACK_TIMEOUT_MS  5000UL      // เวลารอ ACK จาก Gateway สูงสุด (5 วินาที)
 
-// Base Unix Epoch เริ่มต้น (เช่น 2026-10-14 00:00:00 UTC = 1791936000UL)
-// เวลาจะเดินหน้าตามนาฬิกาภายใน ESP32 ต่อเนื่องอัตโนมัติ (วินาทีละ 1)
-#define BASE_EPOCH                1791936000UL
+// Base Unix Epoch เริ่มต้น (2026-10-17 08:40:00 UTC = 1792226400UL หรือ 15:40:00 เวลาไทย)
+// และมีระบบซิงค์เวลาอัตโนมัติจาก Gateway ผ่าน LoRaWAN DeviceTimeReq
+#define BASE_EPOCH                1792226400UL
 
 // ==============================================================================
 // 2. ช่วงค่าจำลองเซนเซอร์ (DUMMY SENSOR RANGES) - ปรับเปลี่ยนได้ที่นี่
@@ -453,6 +453,18 @@ extern "C" void downLinkAckHandle() {
     }
 }
 
+bool isTimeSynced = false;
+
+extern "C" void dev_time_updated() {
+    TimerSysTime_t sysTimeCurrent = TimerGetSysTime();
+    if (sysTimeCurrent.Seconds > 1700000000) {
+        struct timeval tv = { .tv_sec = (time_t)sysTimeCurrent.Seconds, .tv_usec = 0 };
+        settimeofday(&tv, NULL);
+        isTimeSynced = true;
+        Serial.printf("[TIME SYNC] ซิงค์เวลาจาก LoRaWAN Gateway สำเร็จ! Epoch: %lu\n", (unsigned long)sysTimeCurrent.Seconds);
+    }
+}
+
 bool sendConfirmedAndWait(const uint8_t *payload, uint8_t size, uint32_t ackTimeoutMs) {
     memcpy(appData, payload, size);
     appDataSize = size;
@@ -473,6 +485,14 @@ bool sendConfirmedAndWait(const uint8_t *payload, uint8_t size, uint32_t ackTime
     mibReq.Type = MIB_CHANNELS_DEFAULT_DATARATE;
     mibReq.Param.ChannelsDefaultDatarate = DR_2;
     LoRaMacMibSetRequestConfirm(&mibReq);
+
+    // ขอซิงค์เวลาจาก ChirpStack / LoRaWAN Gateway หากยังไม่ได้ซิงค์
+    if (!isTimeSynced) {
+        MlmeReq_t mlmeTimeReq;
+        mlmeTimeReq.Type = MLME_DEVICE_TIME;
+        LoRaMacMlmeRequest(&mlmeTimeReq);
+        Serial.println(F("[TIME] แนบคำขอซิงค์เวลาจาก Gateway (DeviceTimeReq) ไปกับ Uplink..."));
+    }
 
     LoRaWAN.send();
     Serial.printf("[LORAWAN] กำลังส่ง Uplink Confirmed (%d bytes) ที่ DR %d รอ ACK...\n", size, currentDrForNoAdr);
