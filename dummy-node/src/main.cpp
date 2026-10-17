@@ -55,17 +55,12 @@ const float MOCK_GYRO_MAX     = 15.0f;     // มุมเอียง Gyro X, Y
 const float MOCK_BAT_V_MIN    = 12.50f;    // แรงดันแบตเตอรี่ต่ำสุด (V)
 const float MOCK_BAT_V_MAX    = 13.60f;    // แรงดันแบตเตอรี่สูงสุด (V)
 
-// 1. กำหนดพิกัดศูนย์กลางให้ตรงกับจุดอ้างอิงของสถานี ST-004
-const float MOCK_LAT_CENTER   = 14.035269f;  // << ใส่ Latitude จุดอ้างอิงของสถานีจริง
-const float MOCK_LNG_CENTER   = 100.729226f; // << ใส่ Longitude จุดอ้างอิงของสถานีจริง
-
-// 2. ปรับระยะแกว่งไม่เกิน 40 เมตร (แนะนำ 0.00025f หรือ 0.00020f)
-const float MOCK_GPS_JITTER   = 0.00025f;  // << แกว่งแกนละประมาณ +/- 27 เมตร (ระยะรวมไม่เกิน 40 เมตรแน่นอน)
-
-// ================= LoRaWAN Config (OTAA) =================
+// ================= LoRaWAN Config (OTAA) & Credentials =================
 #if __has_include("credentials.h")
 #include "credentials.h"
-#else
+#endif
+
+#ifndef DEV_EUI_SET
 // Placeholder credentials (Copy include/credentials.h.example to include/credentials.h and set your keys)
 uint8_t devEui[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
 uint8_t appEui[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
@@ -78,6 +73,17 @@ uint8_t  appSKey[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                       0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
 uint32_t devAddr   = (uint32_t)0x00000000;
 #endif
+
+// 1. กำหนดพิกัดศูนย์กลางสถานี (หากมี credentials.h จะดึงพิกัดจริงมาใช้ หากไม่มีจะใช้พิกัดจำลอง Generic)
+#ifndef MOCK_LAT_CENTER
+#define MOCK_LAT_CENTER   13.7563f  // พิกัด GPS จำลองเริ่มต้น (Placeholder)
+#endif
+#ifndef MOCK_LNG_CENTER
+#define MOCK_LNG_CENTER   100.5018f // พิกัด GPS จำลองเริ่มต้น (Placeholder)
+#endif
+
+// 2. ปรับระยะแกว่งไม่เกิน 40 เมตร (แนะนำ 0.00025f หรือ 0.00020f)
+const float MOCK_GPS_JITTER   = 0.00025f;  // << แกว่งแกนละประมาณ +/- 27 เมตร (ระยะรวมไม่เกิน 40 เมตรแน่นอน)
 
 uint16_t userChannelsMask[6] = {0x0002, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000};
 LoRaMacRegion_t loraWanRegion = ACTIVE_REGION;
